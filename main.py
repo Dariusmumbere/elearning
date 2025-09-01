@@ -176,10 +176,6 @@ class Lesson(LessonBase):
     class Config:
         orm_mode = True
 
-Base.metadata.drop_all(bind=engine)
-Base.metadata.create_all(bind=engine)
-
-
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
@@ -324,7 +320,7 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
-# Module routes
+# Module routes - FIXED: Use ModuleCreate instead of ModuleBase
 @app.post("/courses/{course_id}/modules/", response_model=Module)
 def create_module(
     course_id: int,
@@ -349,6 +345,15 @@ def create_module(
     db.commit()
     db.refresh(db_module)
     return db_module
+
+# Get modules for a course
+@app.get("/courses/{course_id}/modules/", response_model=List[Module])
+def get_course_modules(
+    course_id: int,
+    db: Session = Depends(get_db)
+):
+    modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
+    return modules
 
 # Lesson routes
 @app.post("/modules/{module_id}/lessons/", response_model=Lesson)
@@ -454,8 +459,6 @@ def get_my_courses(
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
     return courses
 
-# Add these endpoints to main.py
-
 # Get courses for the current instructor
 @app.get("/instructor/courses/", response_model=List[Course])
 def get_instructor_courses(
@@ -467,21 +470,6 @@ def get_instructor_courses(
     
     courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
     return courses
-
-# Get modules for a course
-@app.get("/courses/{course_id}/modules/", response_model=List[Module])
-def get_course_modules(
-    course_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Verify the course belongs to the current instructor
-    course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
-    
-    modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
-    return modules
 
 # Update course endpoint
 @app.put("/courses/{course_id}", response_model=Course)
@@ -506,6 +494,125 @@ def update_course(
     db.commit()
     db.refresh(course)
     return course
+
+# Get lessons for a module
+@app.get("/modules/{module_id}/lessons/", response_model=List[Lesson])
+def get_module_lessons(
+    module_id: int,
+    db: Session = Depends(get_db)
+):
+    lessons = db.query(LessonModel).filter(LessonModel.module_id == module_id).order_by(LessonModel.order).all()
+    return lessons
+
+# Get a specific lesson
+@app.get("/lessons/{lesson_id}", response_model=Lesson)
+def get_lesson(
+    lesson_id: int,
+    db: Session = Depends(get_db)
+):
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    return lesson
+
+# Update a lesson
+@app.put("/lessons/{lesson_id}", response_model=Lesson)
+def update_lesson(
+    lesson_id: int,
+    lesson_data: LessonBase,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can update lessons")
+    
+    lesson = db.query(LessonModel).join(ModuleModel).join(CourseModel).filter(
+        LessonModel.id == lesson_id,
+        CourseModel.instructor_id == current_user.id
+    ).first()
+    
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
+    
+    lesson.title = lesson_data.title
+    lesson.content = lesson_data.content
+    lesson.order = lesson_data.order
+    lesson.video_url = lesson_data.video_url
+    
+    db.commit()
+    db.refresh(lesson)
+    return lesson
+
+# Update a module
+@app.put("/modules/{module_id}", response_model=Module)
+def update_module(
+    module_id: int,
+    module_data: ModuleBase,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can update modules")
+    
+    module = db.query(ModuleModel).join(CourseModel).filter(
+        ModuleModel.id == module_id,
+        CourseModel.instructor_id == current_user.id
+    ).first()
+    
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
+    
+    module.title = module_data.title
+    module.description = module_data.description
+    module.order = module_data.order
+    
+    db.commit()
+    db.refresh(module)
+    return module
+
+# Delete a module
+@app.delete("/modules/{module_id}")
+def delete_module(
+    module_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can delete modules")
+    
+    module = db.query(ModuleModel).join(CourseModel).filter(
+        ModuleModel.id == module_id,
+        CourseModel.instructor_id == current_user.id
+    ).first()
+    
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
+    
+    db.delete(module)
+    db.commit()
+    return {"message": "Module deleted successfully"}
+
+# Delete a lesson
+@app.delete("/lessons/{lesson_id}")
+def delete_lesson(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can delete lessons")
+    
+    lesson = db.query(LessonModel).join(ModuleModel).join(CourseModel).filter(
+        LessonModel.id == lesson_id,
+        CourseModel.instructor_id == current_user.id
+    ).first()
+    
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
+    
+    db.delete(lesson)
+    db.commit()
+    return {"message": "Lesson deleted successfully"}
     
 if __name__ == "__main__":
     import uvicorn
