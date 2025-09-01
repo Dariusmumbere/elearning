@@ -460,7 +460,7 @@ def get_instructor_courses(
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
     
-    courses = db.query(Course).filter(Course.instructor_id == current_user.id).all()
+    courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
     return courses
 
 # Get modules for a course
@@ -471,11 +471,11 @@ def get_course_modules(
     db: Session = Depends(get_db)
 ):
     # Verify the course belongs to the current instructor
-    course = db.query(Course).filter(Course.id == course_id, Course.instructor_id == current_user.id).first()
+    course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
     
-    modules = db.query(Module).filter(Module.course_id == course_id).order_by(Module.order).all()
+    modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
     return modules
 
 # Update course endpoint
@@ -489,7 +489,7 @@ def update_course(
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can update courses")
     
-    course = db.query(Course).filter(Course.id == course_id, Course.instructor_id == current_user.id).first()
+    course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
     
