@@ -22,6 +22,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 # Database Models
 class UserModel(Base):
     __tablename__ = "users"
@@ -174,6 +175,10 @@ class Lesson(LessonBase):
     module_id: int
     class Config:
         orm_mode = True
+
+Base.metadata.drop_all(bind=engine)
+Base.metadata.create_all(bind=engine)
+
 
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
