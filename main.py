@@ -449,6 +449,59 @@ def get_my_courses(
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
     return courses
 
+# Add these endpoints to main.py
+
+# Get courses for the current instructor
+@app.get("/instructor/courses/", response_model=List[Course])
+def get_instructor_courses(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
+    
+    courses = db.query(Course).filter(Course.instructor_id == current_user.id).all()
+    return courses
+
+# Get modules for a course
+@app.get("/courses/{course_id}/modules/", response_model=List[Module])
+def get_course_modules(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Verify the course belongs to the current instructor
+    course = db.query(Course).filter(Course.id == course_id, Course.instructor_id == current_user.id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
+    
+    modules = db.query(Module).filter(Module.course_id == course_id).order_by(Module.order).all()
+    return modules
+
+# Update course endpoint
+@app.put("/courses/{course_id}", response_model=Course)
+def update_course(
+    course_id: int,
+    course_data: CourseCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can update courses")
+    
+    course = db.query(Course).filter(Course.id == course_id, Course.instructor_id == current_user.id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
+    
+    course.title = course_data.title
+    course.description = course_data.description
+    if course_data.image_url:
+        course.image_url = course_data.image_url
+    
+    db.commit()
+    db.refresh(course)
+    return course
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
