@@ -155,6 +155,10 @@ class ModuleBase(BaseModel):
 class ModuleCreate(ModuleBase):
     course_id: int
 
+# New model for module creation without course_id in request body
+class ModuleCreateRequest(ModuleBase):
+    pass
+
 class Module(ModuleBase):
     id: int
     course_id: int
@@ -320,11 +324,11 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
-# Module routes - FIXED: Use ModuleCreate instead of ModuleBase
+# Module routes - FIXED: Use ModuleCreateRequest instead of ModuleCreate
 @app.post("/courses/{course_id}/modules/", response_model=Module)
 def create_module(
     course_id: int,
-    module: ModuleCreate,  # Keep ModuleCreate but ignore its course_id
+    module: ModuleCreateRequest,  # Changed from ModuleCreate
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -338,7 +342,7 @@ def create_module(
     db_module = ModuleModel(
         title=module.title,
         description=module.description,
-        course_id=course_id,  # Use course_id from URL, not from request body
+        course_id=course_id,  # Get course_id from URL parameter
         order=module.order
     )
     db.add(db_module)
