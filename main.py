@@ -20,7 +20,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # Database Models
-class User(Base):
+class UserModel(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -31,10 +31,10 @@ class User(Base):
     is_instructor = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    courses = relationship("Course", back_populates="instructor")
-    enrollments = relationship("Enrollment", back_populates="user")
+    courses = relationship("CourseModel", back_populates="instructor")
+    enrollments = relationship("EnrollmentModel", back_populates="user")
 
-class Course(Base):
+class CourseModel(Base):
     __tablename__ = "courses"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -44,11 +44,11 @@ class Course(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_published = Column(Boolean, default=False)
     
-    instructor = relationship("User", back_populates="courses")
-    modules = relationship("Module", back_populates="course")
-    enrollments = relationship("Enrollment", back_populates="course")
+    instructor = relationship("UserModel", back_populates="courses")
+    modules = relationship("ModuleModel", back_populates="course")
+    enrollments = relationship("EnrollmentModel", back_populates="course")
 
-class Module(Base):
+class ModuleModel(Base):
     __tablename__ = "modules"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -57,10 +57,10 @@ class Module(Base):
     course_id = Column(Integer, ForeignKey("courses.id"))
     order = Column(Integer)
     
-    course = relationship("Course", back_populates="modules")
-    lessons = relationship("Lesson", back_populates="module")
+    course = relationship("CourseModel", back_populates="modules")
+    lessons = relationship("LessonModel", back_populates="module")
 
-class Lesson(Base):
+class LessonModel(Base):
     __tablename__ = "lessons"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -70,10 +70,10 @@ class Lesson(Base):
     order = Column(Integer)
     video_url = Column(String, nullable=True)
     
-    module = relationship("Module", back_populates="lessons")
-    progress = relationship("Progress", back_populates="lesson")
+    module = relationship("ModuleModel", back_populates="lessons")
+    progress = relationship("ProgressModel", back_populates="lesson")
 
-class Enrollment(Base):
+class EnrollmentModel(Base):
     __tablename__ = "enrollments"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -81,11 +81,11 @@ class Enrollment(Base):
     course_id = Column(Integer, ForeignKey("courses.id"))
     enrolled_at = Column(DateTime, default=datetime.utcnow)
     
-    user = relationship("User", back_populates="enrollments")
-    course = relationship("Course", back_populates="enrollments")
-    progress = relationship("Progress", back_populates="enrollment")
+    user = relationship("UserModel", back_populates="enrollments")
+    course = relationship("CourseModel", back_populates="enrollments")
+    progress = relationship("ProgressModel", back_populates="enrollment")
 
-class Progress(Base):
+class ProgressModel(Base):
     __tablename__ = "progress"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -94,8 +94,8 @@ class Progress(Base):
     completed = Column(Boolean, default=False)
     completed_at = Column(DateTime, nullable=True)
     
-    enrollment = relationship("Enrollment", back_populates="progress")
-    lesson = relationship("Lesson", back_populates="progress")
+    enrollment = relationship("EnrollmentModel", back_populates="progress")
+    lesson = relationship("LessonModel", back_populates="progress")
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -175,7 +175,7 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 def get_user_by_email(db: Session, email: str):
-    return db.query(User).filter(User.email == email).first()
+    return db.query(UserModel).filter(UserModel.email == email).first()
 
 def authenticate_user(db: Session, email: str, password: str):
     user = get_user_by_email(db, email)
@@ -237,7 +237,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_password = get_password_hash(user.password)
-    db_user = User(
+    db_user = UserModel(
         email=user.email, 
         hashed_password=hashed_password, 
         full_name=user.full_name,
@@ -262,7 +262,7 @@ def create_course(
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can create courses")
     
-    db_course = Course(
+    db_course = CourseModel(
         title=course.title,
         description=course.description,
         instructor_id=current_user.id
@@ -274,12 +274,12 @@ def create_course(
 
 @app.get("/courses/", response_model=List[Course])
 def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    courses = db.query(Course).filter(Course.is_published == True).offset(skip).limit(limit).all()
+    courses = db.query(CourseModel).filter(CourseModel.is_published == True).offset(skip).limit(limit).all()
     return courses
 
 @app.get("/courses/{course_id}", response_model=Course)
 def read_course(course_id: int, db: Session = Depends(get_db)):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
     return course
@@ -291,20 +291,20 @@ def enroll_in_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
     
     # Check if already enrolled
-    existing_enrollment = db.query(Enrollment).filter(
-        Enrollment.user_id == current_user.id,
-        Enrollment.course_id == course_id
+    existing_enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
     ).first()
     
     if existing_enrollment:
         raise HTTPException(status_code=400, detail="Already enrolled in this course")
     
-    enrollment = Enrollment(user_id=current_user.id, course_id=course_id)
+    enrollment = EnrollmentModel(user_id=current_user.id, course_id=course_id)
     db.add(enrollment)
     db.commit()
     
@@ -315,9 +315,9 @@ def get_my_courses(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    enrollments = db.query(Enrollment).filter(Enrollment.user_id == current_user.id).all()
+    enrollments = db.query(EnrollmentModel).filter(EnrollmentModel.user_id == current_user.id).all()
     course_ids = [enrollment.course_id for enrollment in enrollments]
-    courses = db.query(Course).filter(Course.id.in_(course_ids)).all()
+    courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
     return courses
 
 if __name__ == "__main__":
