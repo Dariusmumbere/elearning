@@ -13,7 +13,7 @@ from passlib.context import CryptContext
 import os
 
 # Database configuration (using your credentials)
-DATABASE_URL = "postgresql://username:password@hostname:port/database_name"
+DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
