@@ -1,5 +1,6 @@
 # main.py (FastAPI backend)
-from fastapi import FastAPI, Depends, HTTPException, status
+
+from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
@@ -11,6 +12,8 @@ from typing import Optional, List
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
+import shutil
+import uuid
 
 # Database configuration (using your credentials)
 DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
@@ -43,6 +46,7 @@ class CourseModel(Base):
     instructor_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     is_published = Column(Boolean, default=False)
+    image_url = Column(String, nullable=True)  # Added field
     
     instructor = relationship("UserModel", back_populates="courses")
     modules = relationship("ModuleModel", back_populates="course")
@@ -128,6 +132,7 @@ class TokenData(BaseModel):
 class CourseBase(BaseModel):
     title: str
     description: Optional[str] = None
+    image_url: Optional[str] = None
 
 class CourseCreate(CourseBase):
     pass
@@ -138,6 +143,35 @@ class Course(CourseBase):
     created_at: datetime
     is_published: bool
     
+    class Config:
+        orm_mode = True
+
+class ModuleBase(BaseModel):
+    title: str
+    description: Optional[str] = None
+    order: int
+
+class ModuleCreate(ModuleBase):
+    course_id: int
+
+class Module(ModuleBase):
+    id: int
+    course_id: int
+    class Config:
+        orm_mode = True
+
+class LessonBase(BaseModel):
+    title: str
+    content: Optional[str] = None
+    order: int
+    video_url: Optional[str] = None
+
+class LessonCreate(LessonBase):
+    module_id: int
+
+class Lesson(LessonBase):
+    id: int
+    module_id: int
     class Config:
         orm_mode = True
 
@@ -265,7 +299,8 @@ def create_course(
     db_course = CourseModel(
         title=course.title,
         description=course.description,
-        instructor_id=current_user.id
+        instructor_id=current_user.id,
+        image_url=course.image_url
     )
     db.add(db_course)
     db.commit()
@@ -284,6 +319,101 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
+# Module routes
+@app.post("/courses/{course_id}/modules/", response_model=Module)
+def create_module(
+    course_id: int,
+    module: ModuleCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can create modules")
+    
+    course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
+    
+    db_module = ModuleModel(
+        title=module.title,
+        description=module.description,
+        course_id=course_id,
+        order=module.order
+    )
+    db.add(db_module)
+    db.commit()
+    db.refresh(db_module)
+    return db_module
+
+# Lesson routes
+@app.post("/modules/{module_id}/lessons/", response_model=Lesson)
+def create_lesson(
+    module_id: int,
+    lesson: LessonCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can create lessons")
+    
+    module = db.query(ModuleModel).join(CourseModel).filter(
+        ModuleModel.id == module_id, 
+        CourseModel.instructor_id == current_user.id
+    ).first()
+    
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
+    
+    db_lesson = LessonModel(
+        title=lesson.title,
+        content=lesson.content,
+        module_id=module_id,
+        order=lesson.order,
+        video_url=lesson.video_url
+    )
+    db.add(db_lesson)
+    db.commit()
+    db.refresh(db_lesson)
+    return db_lesson
+
+# Publish course
+@app.put("/courses/{course_id}/publish/")
+def publish_course(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can publish courses")
+    
+    course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
+    
+    course.is_published = True
+    db.commit()
+    return {"message": "Course published successfully"}
+
+# File upload
+@app.post("/upload/course-image/")
+async def upload_course_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can upload images")
+    
+    os.makedirs("uploads/courses", exist_ok=True)
+    
+    file_extension = file.filename.split(".")[-1]
+    filename = f"{uuid.uuid4()}.{file_extension}"
+    file_path = f"uploads/courses/{filename}"
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    return {"filename": filename, "url": f"/uploads/courses/{filename}"}
+
 # Enrollment routes
 @app.post("/enroll/{course_id}")
 def enroll_in_course(
@@ -295,7 +425,6 @@ def enroll_in_course(
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
     
-    # Check if already enrolled
     existing_enrollment = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id,
         EnrollmentModel.course_id == course_id
