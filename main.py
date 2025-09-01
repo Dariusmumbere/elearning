@@ -324,7 +324,7 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
 @app.post("/courses/{course_id}/modules/", response_model=Module)
 def create_module(
     course_id: int,
-    module: ModuleCreate,
+    module: ModuleCreate,  # Keep ModuleCreate but ignore its course_id
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -338,7 +338,7 @@ def create_module(
     db_module = ModuleModel(
         title=module.title,
         description=module.description,
-        course_id=course_id,
+        course_id=course_id,  # Use course_id from URL, not from request body
         order=module.order
     )
     db.add(db_module)
