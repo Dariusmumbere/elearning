@@ -454,13 +454,30 @@ async def create_lesson(
 @app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse])
 def get_module_lessons(
     module_id: int,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     lessons = db.query(LessonModel).filter(LessonModel.module_id == module_id).order_by(LessonModel.order).all()
     
-    # Build response with proper video URLs
+    # Check if user is enrolled in this course
+    module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == module.course_id
+    ).first()
+    
+    # Build response with proper video URLs and progress
     response_lessons = []
     for lesson in lessons:
+        completed = False
+        if enrollment:
+            progress = db.query(ProgressModel).filter(
+                ProgressModel.enrollment_id == enrollment.id,
+                ProgressModel.lesson_id == lesson.id,
+                ProgressModel.completed == True
+            ).first()
+            completed = progress is not None
+        
         lesson_data = {
             "id": lesson.id,
             "title": lesson.title,
@@ -468,7 +485,8 @@ def get_module_lessons(
             "order": lesson.order,
             "module_id": lesson.module_id,
             "video_url": lesson.video_url,
-            "video_filename": lesson.video_filename
+            "video_filename": lesson.video_filename,
+            "completed": completed
         }
         
         # If there's an uploaded video file, provide the URL
@@ -478,7 +496,6 @@ def get_module_lessons(
         response_lessons.append(lesson_data)
     
     return response_lessons
-
 # Serve uploaded lesson videos
 @app.get("/uploads/lessons/{filename}")
 async def get_lesson_video(filename: str):
@@ -787,6 +804,86 @@ def delete_lesson(
     db.delete(lesson)
     db.commit()
     return {"message": "Lesson deleted successfully"}
+
+# Progress tracking endpoints
+@app.post("/progress/lesson/{lesson_id}/complete")
+def mark_lesson_complete(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Find the enrollment for this user and course
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Not enrolled in this course")
+    
+    # Check if progress already exists
+    progress = db.query(ProgressModel).filter(
+        ProgressModel.enrollment_id == enrollment.id,
+        ProgressModel.lesson_id == lesson_id
+    ).first()
+    
+    if progress:
+        # Already completed
+        return {"message": "Lesson already completed"}
+    
+    # Create new progress record
+    progress = ProgressModel(
+        enrollment_id=enrollment.id,
+        lesson_id=lesson_id,
+        completed=True,
+        completed_at=datetime.utcnow()
+    )
+    db.add(progress)
+    db.commit()
+    
+    return {"message": "Lesson marked as complete"}
+
+@app.get("/progress/course/{course_id}")
+def get_course_progress(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
+    ).first()
+    
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Not enrolled in this course")
+    
+    # Get all lessons in the course
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    total_lessons = 0
+    completed_lessons = 0
+    
+    for module in course.modules:
+        total_lessons += len(module.lessons)
+        for lesson in module.lessons:
+            progress = db.query(ProgressModel).filter(
+                ProgressModel.enrollment_id == enrollment.id,
+                ProgressModel.lesson_id == lesson.id,
+                ProgressModel.completed == True
+            ).first()
+            if progress:
+                completed_lessons += 1
+    
+    progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
+    
+    return {
+        "total_lessons": total_lessons,
+        "completed_lessons": completed_lessons,
+        "progress_percentage": progress_percentage
+    }
     
 if __name__ == "__main__":
     import uvicorn
