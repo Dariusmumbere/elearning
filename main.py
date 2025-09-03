@@ -196,7 +196,8 @@ class LessonResponse(BaseModel):
     
     class Config:
         orm_mode = True
-
+Base.metadata.drop_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
