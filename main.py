@@ -1,6 +1,6 @@
 # main.py (FastAPI backend)
 
-from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
@@ -8,12 +8,13 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Union
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
 import shutil
 import uuid
+from pathlib import Path
 
 # Database configuration (using your credentials)
 DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
@@ -22,6 +23,9 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Create upload directories if they don't exist
+Path("uploads/courses").mkdir(parents=True, exist_ok=True)
+Path("uploads/lessons").mkdir(parents=True, exist_ok=True)
 
 # Database Models
 class UserModel(Base):
@@ -47,7 +51,7 @@ class CourseModel(Base):
     instructor_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     is_published = Column(Boolean, default=False)
-    image_url = Column(String, nullable=True)  # Added field
+    image_url = Column(String, nullable=True)
     
     instructor = relationship("UserModel", back_populates="courses")
     modules = relationship("ModuleModel", back_populates="course")
@@ -74,6 +78,7 @@ class LessonModel(Base):
     module_id = Column(Integer, ForeignKey("modules.id"))
     order = Column(Integer)
     video_url = Column(String, nullable=True)
+    video_filename = Column(String, nullable=True)
     
     module = relationship("ModuleModel", back_populates="lessons")
     progress = relationship("ProgressModel", back_populates="lesson")
@@ -155,7 +160,6 @@ class ModuleBase(BaseModel):
 class ModuleCreate(ModuleBase):
     course_id: int
 
-# New model for module creation without course_id in request body
 class ModuleCreateRequest(ModuleBase):
     pass
 
@@ -177,6 +181,19 @@ class LessonCreate(LessonBase):
 class Lesson(LessonBase):
     id: int
     module_id: int
+    video_filename: Optional[str] = None
+    class Config:
+        orm_mode = True
+
+class LessonResponse(BaseModel):
+    id: int
+    title: str
+    content: Optional[str] = None
+    order: int
+    module_id: int
+    video_url: Optional[str] = None
+    video_filename: Optional[str] = None
+    
     class Config:
         orm_mode = True
 
@@ -324,11 +341,11 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
-# Module routes - FIXED: Use ModuleCreateRequest instead of ModuleCreate
+# Module routes
 @app.post("/courses/{course_id}/modules/", response_model=Module)
 def create_module(
     course_id: int,
-    module: ModuleCreateRequest,  # Changed from ModuleCreate
+    module: ModuleCreateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -342,7 +359,7 @@ def create_module(
     db_module = ModuleModel(
         title=module.title,
         description=module.description,
-        course_id=course_id,  # Get course_id from URL parameter
+        course_id=course_id,
         order=module.order
     )
     db.add(db_module)
@@ -359,17 +376,22 @@ def get_course_modules(
     modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
     return modules
 
-# Lesson routes
-@app.post("/modules/{module_id}/lessons/", response_model=Lesson)
-def create_lesson(
-    module_id: int,  # Get module_id from path parameter
-    lesson: LessonCreate,  # Now this doesn't expect module_id
+# Lesson routes - UPDATED for robust lesson creation
+@app.post("/modules/{module_id}/lessons/", response_model=LessonResponse)
+async def create_lesson(
+    module_id: int,
+    title: str = Form(...),
+    content: str = Form(None),
+    order: int = Form(1),
+    video_url: Optional[str] = Form(None),
+    video_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can create lessons")
     
+    # Verify the module exists and belongs to the current instructor
     module = db.query(ModuleModel).join(CourseModel).filter(
         ModuleModel.id == module_id, 
         CourseModel.instructor_id == current_user.id
@@ -378,17 +400,93 @@ def create_lesson(
     if not module:
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
+    # Handle video file upload if provided
+    video_filename = None
+    if video_file:
+        # Validate file type
+        allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
+        if video_file.content_type not in allowed_video_types:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
+            )
+        
+        # Generate unique filename
+        file_extension = video_file.filename.split(".")[-1]
+        video_filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = f"uploads/lessons/{video_filename}"
+        
+        # Save the file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(video_file.file, buffer)
+    
+    # Create the lesson
     db_lesson = LessonModel(
-        title=lesson.title,
-        content=lesson.content,
-        module_id=module_id,  # Use the path parameter here
-        order=lesson.order,
-        video_url=lesson.video_url
+        title=title,
+        content=content,
+        module_id=module_id,
+        order=order,
+        video_url=video_url,
+        video_filename=video_filename
     )
+    
     db.add(db_lesson)
     db.commit()
     db.refresh(db_lesson)
-    return db_lesson
+    
+    # Build the response with the video URL if a file was uploaded
+    response_data = {
+        "id": db_lesson.id,
+        "title": db_lesson.title,
+        "content": db_lesson.content,
+        "order": db_lesson.order,
+        "module_id": db_lesson.module_id,
+        "video_url": db_lesson.video_url,
+        "video_filename": db_lesson.video_filename
+    }
+    
+    # If a video file was uploaded, include the URL to access it
+    if video_filename:
+        response_data["video_url"] = f"/uploads/lessons/{video_filename}"
+    
+    return response_data
+
+# Get lessons for a module
+@app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse])
+def get_module_lessons(
+    module_id: int,
+    db: Session = Depends(get_db)
+):
+    lessons = db.query(LessonModel).filter(LessonModel.module_id == module_id).order_by(LessonModel.order).all()
+    
+    # Build response with proper video URLs
+    response_lessons = []
+    for lesson in lessons:
+        lesson_data = {
+            "id": lesson.id,
+            "title": lesson.title,
+            "content": lesson.content,
+            "order": lesson.order,
+            "module_id": lesson.module_id,
+            "video_url": lesson.video_url,
+            "video_filename": lesson.video_filename
+        }
+        
+        # If there's an uploaded video file, provide the URL
+        if lesson.video_filename:
+            lesson_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
+            
+        response_lessons.append(lesson_data)
+    
+    return response_lessons
+
+# Serve uploaded lesson videos
+@app.get("/uploads/lessons/{filename}")
+async def get_lesson_video(filename: str):
+    file_path = f"uploads/lessons/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
 
 # Publish course
 @app.put("/courses/{course_id}/publish/")
@@ -427,6 +525,14 @@ async def upload_course_image(
         shutil.copyfileobj(file.file, buffer)
     
     return {"filename": filename, "url": f"/uploads/courses/{filename}"}
+
+# Serve uploaded course images
+@app.get("/uploads/courses/{filename}")
+async def get_course_image(filename: str):
+    file_path = f"uploads/courses/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
 
 # Enrollment routes
 @app.post("/enroll/{course_id}")
@@ -499,17 +605,8 @@ def update_course(
     db.refresh(course)
     return course
 
-# Get lessons for a module
-@app.get("/modules/{module_id}/lessons/", response_model=List[Lesson])
-def get_module_lessons(
-    module_id: int,
-    db: Session = Depends(get_db)
-):
-    lessons = db.query(LessonModel).filter(LessonModel.module_id == module_id).order_by(LessonModel.order).all()
-    return lessons
-
 # Get a specific lesson
-@app.get("/lessons/{lesson_id}", response_model=Lesson)
+@app.get("/lessons/{lesson_id}", response_model=LessonResponse)
 def get_lesson(
     lesson_id: int,
     db: Session = Depends(get_db)
@@ -517,13 +614,32 @@ def get_lesson(
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
-    return lesson
+    
+    response_data = {
+        "id": lesson.id,
+        "title": lesson.title,
+        "content": lesson.content,
+        "order": lesson.order,
+        "module_id": lesson.module_id,
+        "video_url": lesson.video_url,
+        "video_filename": lesson.video_filename
+    }
+    
+    # If there's an uploaded video file, provide the URL
+    if lesson.video_filename:
+        response_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
+    
+    return response_data
 
 # Update a lesson
-@app.put("/lessons/{lesson_id}", response_model=Lesson)
-def update_lesson(
+@app.put("/lessons/{lesson_id}", response_model=LessonResponse)
+async def update_lesson(
     lesson_id: int,
-    lesson_data: LessonBase,
+    title: str = Form(None),
+    content: str = Form(None),
+    order: int = Form(None),
+    video_url: Optional[str] = Form(None),
+    video_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -538,14 +654,63 @@ def update_lesson(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
     
-    lesson.title = lesson_data.title
-    lesson.content = lesson_data.content
-    lesson.order = lesson_data.order
-    lesson.video_url = lesson_data.video_url
+    # Update fields if provided
+    if title is not None:
+        lesson.title = title
+    if content is not None:
+        lesson.content = content
+    if order is not None:
+        lesson.order = order
+    if video_url is not None:
+        lesson.video_url = video_url
+    
+    # Handle video file upload if provided
+    if video_file:
+        # Validate file type
+        allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
+        if video_file.content_type not in allowed_video_types:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
+            )
+        
+        # Remove old video file if it exists
+        if lesson.video_filename:
+            old_file_path = f"uploads/lessons/{lesson.video_filename}"
+            if os.path.exists(old_file_path):
+                os.remove(old_file_path)
+        
+        # Generate unique filename
+        file_extension = video_file.filename.split(".")[-1]
+        video_filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = f"uploads/lessons/{video_filename}"
+        
+        # Save the file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(video_file.file, buffer)
+        
+        lesson.video_filename = video_filename
+        lesson.video_url = f"/uploads/lessons/{video_filename}"
     
     db.commit()
     db.refresh(lesson)
-    return lesson
+    
+    # Build the response
+    response_data = {
+        "id": lesson.id,
+        "title": lesson.title,
+        "content": lesson.content,
+        "order": lesson.order,
+        "module_id": lesson.module_id,
+        "video_url": lesson.video_url,
+        "video_filename": lesson.video_filename
+    }
+    
+    # If there's an uploaded video file, provide the URL
+    if lesson.video_filename:
+        response_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
+    
+    return response_data
 
 # Update a module
 @app.put("/modules/{module_id}", response_model=Module)
@@ -613,6 +778,12 @@ def delete_lesson(
     
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
+    
+    # Remove associated video file if it exists
+    if lesson.video_filename:
+        file_path = f"uploads/lessons/{lesson.video_filename}"
+        if os.path.exists(file_path):
+            os.remove(file_path)
     
     db.delete(lesson)
     db.commit()
