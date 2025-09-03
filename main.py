@@ -110,6 +110,7 @@ class ProgressModel(Base):
     lesson = relationship("LessonModel", back_populates="progress")
 
 # Create tables
+Base.metadata.create_all(bind=engine)
 
 # Pydantic models
 class UserBase(BaseModel):
@@ -357,7 +358,19 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
-    return course
+    
+    # Return the course with the correct image URL
+    course_data = {
+        "id": course.id,
+        "title": course.title,
+        "description": course.description,
+        "instructor_id": course.instructor_id,
+        "created_at": course.created_at,
+        "is_published": course.is_published,
+        "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+    }
+    
+    return course_data
 
 # Module routes
 @app.post("/courses/{course_id}/modules/", response_model=Module)
@@ -515,6 +528,7 @@ def get_module_lessons(
         response_lessons.append(lesson_data)
     
     return response_lessons
+
 # Serve uploaded lesson videos
 @app.get("/uploads/lessons/{filename}")
 async def get_lesson_video(filename: str):
@@ -602,7 +616,22 @@ def get_my_courses(
     enrollments = db.query(EnrollmentModel).filter(EnrollmentModel.user_id == current_user.id).all()
     course_ids = [enrollment.course_id for enrollment in enrollments]
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
-    return courses
+    
+    # Convert ORM objects to dicts and add full image URL
+    course_list = []
+    for course in courses:
+        course_dict = {
+            "id": course.id,
+            "title": course.title,
+            "description": course.description,
+            "instructor_id": course.instructor_id,
+            "created_at": course.created_at,
+            "is_published": course.is_published,
+            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+        }
+        course_list.append(course_dict)
+    
+    return course_list
 
 # Get courses for the current instructor
 @app.get("/instructor/courses/", response_model=List[Course])
@@ -614,7 +643,22 @@ def get_instructor_courses(
         raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
     
     courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
-    return courses
+    
+    # Convert ORM objects to dicts and add full image URL
+    course_list = []
+    for course in courses:
+        course_dict = {
+            "id": course.id,
+            "title": course.title,
+            "description": course.description,
+            "instructor_id": course.instructor_id,
+            "created_at": course.created_at,
+            "is_published": course.is_published,
+            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+        }
+        course_list.append(course_dict)
+    
+    return course_list
 
 # Update course endpoint
 @app.put("/courses/{course_id}", response_model=Course)
@@ -638,7 +682,19 @@ def update_course(
     
     db.commit()
     db.refresh(course)
-    return course
+    
+    # Return the course with the correct image URL
+    course_response = {
+        "id": course.id,
+        "title": course.title,
+        "description": course.description,
+        "instructor_id": course.instructor_id,
+        "created_at": course.created_at,
+        "is_published": course.is_published,
+        "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+    }
+    
+    return course_response
 
 # Get a specific lesson
 @app.get("/lessons/{lesson_id}", response_model=LessonResponse)
@@ -916,6 +972,7 @@ def check_enrollment_status(
     ).first()
     
     return {"is_enrolled": enrollment is not None}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
