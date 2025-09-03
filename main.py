@@ -108,7 +108,6 @@ class ProgressModel(Base):
     lesson = relationship("LessonModel", back_populates="progress")
 
 # Create tables
-Base.metadata.create_all(bind=engine)
 
 # Pydantic models
 class UserBase(BaseModel):
@@ -196,8 +195,7 @@ class LessonResponse(BaseModel):
     
     class Config:
         orm_mode = True
-Base.metadata.drop_all(bind=engine)
-Base.metadata.create_all(bind=engine)
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
