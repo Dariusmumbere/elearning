@@ -884,7 +884,19 @@ def get_course_progress(
         "completed_lessons": completed_lessons,
         "progress_percentage": progress_percentage
     }
+
+@app.get("/enrollment/check/{course_id}")
+def check_enrollment_status(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
+    ).first()
     
+    return {"is_enrolled": enrollment is not None}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
