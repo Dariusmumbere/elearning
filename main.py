@@ -172,7 +172,7 @@ class LessonBase(BaseModel):
     video_url: Optional[str] = None
 
 class LessonCreate(LessonBase):
-    module_id: int
+    pass
 
 class Lesson(LessonBase):
     id: int
@@ -362,8 +362,8 @@ def get_course_modules(
 # Lesson routes
 @app.post("/modules/{module_id}/lessons/", response_model=Lesson)
 def create_lesson(
-    module_id: int,
-    lesson: LessonCreate,
+    module_id: int,  # Get module_id from path parameter
+    lesson: LessonCreate,  # Now this doesn't expect module_id
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -381,7 +381,7 @@ def create_lesson(
     db_lesson = LessonModel(
         title=lesson.title,
         content=lesson.content,
-        module_id=module_id,
+        module_id=module_id,  # Use the path parameter here
         order=lesson.order,
         video_url=lesson.video_url
     )
