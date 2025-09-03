@@ -335,7 +335,22 @@ def create_course(
 @app.get("/courses/", response_model=List[Course])
 def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     courses = db.query(CourseModel).filter(CourseModel.is_published == True).offset(skip).limit(limit).all()
-    return courses
+    
+    # Convert ORM objects to dicts and add full image URL
+    course_list = []
+    for course in courses:
+        course_dict = {
+            "id": course.id,
+            "title": course.title,
+            "description": course.description,
+            "instructor_id": course.instructor_id,
+            "created_at": course.created_at,
+            "is_published": course.is_published,
+            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+        }
+        course_list.append(course_dict)
+    
+    return course_list
 
 @app.get("/courses/{course_id}", response_model=Course)
 def read_course(course_id: int, db: Session = Depends(get_db)):
