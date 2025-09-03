@@ -15,6 +15,8 @@ import os
 import shutil
 import uuid
 from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Database configuration (using your credentials)
 DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
@@ -214,6 +216,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Serve static files
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Dependency
 def get_db():
