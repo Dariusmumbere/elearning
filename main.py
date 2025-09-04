@@ -350,10 +350,12 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
 # NEW: Video Streaming Endpoint
+# Replace the current stream_video endpoint with this corrected version
 @app.get("/stream/video/{filename}")
 async def stream_video(
     filename: str,
     token: str = Query(..., description="JWT token for video access"),
+    request: Request = None,  # Add this parameter
     db: Session = Depends(get_db)
 ):
     try:
@@ -387,11 +389,8 @@ async def stream_video(
         if lesson.video_filename != filename:
             raise HTTPException(status_code=403, detail="Invalid video access")
         
-        # Generate a presigned URL for the video
-        video_url = await generate_presigned_url(filename, expiration=3600)  # 1 hour expiration
-        
-        # Use range requests for streaming
-        range_header = request.headers.get('Range')
+        # Get range header from request
+        range_header = request.headers.get('Range') if request else None
         
         if range_header:
             # Handle range requests for seeking
@@ -417,10 +416,13 @@ async def stream_video(
                     for chunk in response['Body'].iter_chunks():
                         yield chunk
                 
+                content_length = response['ContentLength']
+                content_range = f'bytes {start}-{end if end else content_length-1}/{content_length}'
+                
                 headers = {
-                    'Content-Range': f'bytes {start}-{end if end else response["ContentLength"]-1}/{response["ContentLength"]}',
+                    'Content-Range': content_range,
                     'Accept-Ranges': 'bytes',
-                    'Content-Length': str(response['ContentLength']),
+                    'Content-Length': str(content_length),
                     'Content-Type': response['ContentType']
                 }
                 
@@ -432,7 +434,11 @@ async def stream_video(
                 )
                 
             except ClientError as e:
+                print(f"B2 Client Error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
+            except ValueError as e:
+                print(f"Range header parsing error: {str(e)}")
+                raise HTTPException(status_code=416, detail="Invalid range header")
         
         else:
             # Full video request
@@ -459,10 +465,15 @@ async def stream_video(
                 )
                 
             except ClientError as e:
+                print(f"B2 Client Error (full): {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
     
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
+    except Exception as e:
+        print(f"Unexpected error in stream_video: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        
 
 # NEW: Get video access token endpoint
 @app.get("/video-token/{lesson_id}", response_model=VideoTokenResponse)
