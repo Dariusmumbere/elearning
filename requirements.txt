@@ -10,3 +10,4 @@ python-multipart
 email-validator
 boto3 
 botocore
+requests
