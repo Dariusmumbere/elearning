@@ -1,4 +1,4 @@
-# main.py (FastAPI backend)
+# main.py (FastAPI backend with Backblaze B2 integration)
 
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,24 @@ import shutil
 import uuid
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+import boto3
+from botocore.exceptions import ClientError
+import io
+
+# Backblaze B2 Configuration
+B2_BUCKET_NAME = "uploads-dir"
+B2_ENDPOINT_URL = "https://s3.us-east-005.backblazeb2.com"
+B2_KEY_ID = "0055ca7845641d30000000002"
+B2_APPLICATION_KEY = "K005NNeGM9r28ujQ3jvNEQy2zUiu0TI"
+
+# Initialize B2 client
+b2_client = boto3.client(
+    's3',
+    endpoint_url=B2_ENDPOINT_URL,
+    aws_access_key_id=B2_KEY_ID,
+    aws_secret_access_key=B2_APPLICATION_KEY
+)
 
 # Database configuration (using your credentials)
 DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
@@ -24,10 +41,6 @@ DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-# Create upload directories if they don't exist
-Path("uploads/courses").mkdir(parents=True, exist_ok=True)
-Path("uploads/lessons").mkdir(parents=True, exist_ok=True)
 
 # Database Models
 class UserModel(Base):
@@ -217,8 +230,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Serve static files
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Dependency
 def get_db():
@@ -274,6 +285,50 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     if user is None:
         raise credentials_exception
     return user
+
+# B2 Helper Functions
+async def upload_to_b2(file: UploadFile, folder: str) -> str:
+    """Upload a file to Backblaze B2 and return the URL"""
+    try:
+        # Generate unique filename
+        file_extension = file.filename.split(".")[-1]
+        filename = f"{folder}/{uuid.uuid4()}.{file_extension}"
+        
+        # Read file content
+        file_content = await file.read()
+        
+        # Upload to B2
+        b2_client.put_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=filename,
+            Body=file_content,
+            ContentType=file.content_type
+        )
+        
+        # Generate URL
+        url = f"{B2_ENDPOINT_URL}/{B2_BUCKET_NAME}/{filename}"
+        return url, filename
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
+
+async def delete_from_b2(filename: str):
+    """Delete a file from Backblaze B2"""
+    try:
+        b2_client.delete_object(Bucket=B2_BUCKET_NAME, Key=filename)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
+
+async def get_b2_file_stream(filename: str):
+    """Get a file stream from Backblaze B2"""
+    try:
+        response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=filename)
+        return response['Body']
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail="File not found")
+        else:
+            raise HTTPException(status_code=500, detail=f"Error retrieving file: {str(e)}")
 
 # Auth routes
 @app.post("/token", response_model=Token)
@@ -347,7 +402,7 @@ def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db))
             "instructor_id": course.instructor_id,
             "created_at": course.created_at,
             "is_published": course.is_published,
-            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+            "image_url": course.image_url
         }
         course_list.append(course_dict)
     
@@ -367,7 +422,7 @@ def read_course(course_id: int, db: Session = Depends(get_db)):
         "instructor_id": course.instructor_id,
         "created_at": course.created_at,
         "is_published": course.is_published,
-        "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+        "image_url": course.image_url
     }
     
     return course_data
@@ -407,7 +462,7 @@ def get_course_modules(
     modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
     return modules
 
-# Lesson routes - UPDATED for robust lesson creation
+# Lesson routes - UPDATED for Backblaze B2 integration
 @app.post("/modules/{module_id}/lessons/", response_model=LessonResponse)
 async def create_lesson(
     module_id: int,
@@ -433,6 +488,8 @@ async def create_lesson(
     
     # Handle video file upload if provided
     video_filename = None
+    b2_video_url = None
+    
     if video_file:
         # Validate file type
         allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
@@ -442,14 +499,8 @@ async def create_lesson(
                 detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
             )
         
-        # Generate unique filename
-        file_extension = video_file.filename.split(".")[-1]
-        video_filename = f"{uuid.uuid4()}.{file_extension}"
-        file_path = f"uploads/lessons/{video_filename}"
-        
-        # Save the file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(video_file.file, buffer)
+        # Upload to Backblaze B2
+        b2_video_url, video_filename = await upload_to_b2(video_file, "lessons")
     
     # Create the lesson
     db_lesson = LessonModel(
@@ -457,7 +508,7 @@ async def create_lesson(
         content=content,
         module_id=module_id,
         order=order,
-        video_url=video_url,
+        video_url=b2_video_url if video_file else video_url,
         video_filename=video_filename
     )
     
@@ -465,7 +516,7 @@ async def create_lesson(
     db.commit()
     db.refresh(db_lesson)
     
-    # Build the response with the video URL if a file was uploaded
+    # Build the response
     response_data = {
         "id": db_lesson.id,
         "title": db_lesson.title,
@@ -475,10 +526,6 @@ async def create_lesson(
         "video_url": db_lesson.video_url,
         "video_filename": db_lesson.video_filename
     }
-    
-    # If a video file was uploaded, include the URL to access it
-    if video_filename:
-        response_data["video_url"] = f"/uploads/lessons/{video_filename}"
     
     return response_data
 
@@ -520,22 +567,21 @@ def get_module_lessons(
             "video_filename": lesson.video_filename,
             "completed": completed
         }
-        
-        # If there's an uploaded video file, provide the URL
-        if lesson.video_filename:
-            lesson_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
             
         response_lessons.append(lesson_data)
     
     return response_lessons
 
-# Serve uploaded lesson videos
-@app.get("/uploads/lessons/{filename}")
+# Serve uploaded lesson videos from B2
+@app.get("/b2/lessons/{filename}")
 async def get_lesson_video(filename: str):
-    file_path = f"uploads/lessons/{filename}"
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+    try:
+        file_stream = await get_b2_file_stream(f"lessons/{filename}")
+        return StreamingResponse(file_stream, media_type="video/mp4")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving video: {str(e)}")
 
 # Publish course
 @app.put("/courses/{course_id}/publish/")
@@ -555,7 +601,7 @@ def publish_course(
     db.commit()
     return {"message": "Course published successfully"}
 
-# File upload
+# File upload to B2
 @app.post("/upload/course-image/")
 async def upload_course_image(
     file: UploadFile = File(...),
@@ -564,24 +610,21 @@ async def upload_course_image(
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can upload images")
     
-    os.makedirs("uploads/courses", exist_ok=True)
+    # Upload to Backblaze B2
+    image_url, filename = await upload_to_b2(file, "courses")
     
-    file_extension = file.filename.split(".")[-1]
-    filename = f"{uuid.uuid4()}.{file_extension}"
-    file_path = f"uploads/courses/{filename}"
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    return {"filename": filename, "url": f"/uploads/courses/{filename}"}
+    return {"filename": filename, "url": image_url}
 
-# Serve uploaded course images
-@app.get("/uploads/courses/{filename}")
+# Serve uploaded course images from B2
+@app.get("/b2/courses/{filename}")
 async def get_course_image(filename: str):
-    file_path = f"uploads/courses/{filename}"
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+    try:
+        file_stream = await get_b2_file_stream(f"courses/{filename}")
+        return StreamingResponse(file_stream, media_type="image/jpeg")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving image: {str(e)}")
 
 # Enrollment routes
 @app.post("/enroll/{course_id}")
@@ -617,7 +660,7 @@ def get_my_courses(
     course_ids = [enrollment.course_id for enrollment in enrollments]
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
     
-    # Convert ORM objects to dicts and add full image URL
+    # Convert ORM objects to dicts
     course_list = []
     for course in courses:
         course_dict = {
@@ -627,7 +670,7 @@ def get_my_courses(
             "instructor_id": course.instructor_id,
             "created_at": course.created_at,
             "is_published": course.is_published,
-            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+            "image_url": course.image_url
         }
         course_list.append(course_dict)
     
@@ -644,7 +687,7 @@ def get_instructor_courses(
     
     courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
     
-    # Convert ORM objects to dicts and add full image URL
+    # Convert ORM objects to dicts
     course_list = []
     for course in courses:
         course_dict = {
@@ -654,7 +697,7 @@ def get_instructor_courses(
             "instructor_id": course.instructor_id,
             "created_at": course.created_at,
             "is_published": course.is_published,
-            "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+            "image_url": course.image_url
         }
         course_list.append(course_dict)
     
@@ -683,7 +726,7 @@ def update_course(
     db.commit()
     db.refresh(course)
     
-    # Return the course with the correct image URL
+    # Return the course
     course_response = {
         "id": course.id,
         "title": course.title,
@@ -691,7 +734,7 @@ def update_course(
         "instructor_id": course.instructor_id,
         "created_at": course.created_at,
         "is_published": course.is_published,
-        "image_url": f"/uploads/courses/{course.image_url}" if course.image_url else None
+        "image_url": course.image_url
     }
     
     return course_response
@@ -715,10 +758,6 @@ def get_lesson(
         "video_url": lesson.video_url,
         "video_filename": lesson.video_filename
     }
-    
-    # If there's an uploaded video file, provide the URL
-    if lesson.video_filename:
-        response_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
     
     return response_data
 
@@ -765,23 +804,15 @@ async def update_lesson(
                 detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
             )
         
-        # Remove old video file if it exists
+        # Remove old video file from B2 if it exists
         if lesson.video_filename:
-            old_file_path = f"uploads/lessons/{lesson.video_filename}"
-            if os.path.exists(old_file_path):
-                os.remove(old_file_path)
+            await delete_from_b2(lesson.video_filename)
         
-        # Generate unique filename
-        file_extension = video_file.filename.split(".")[-1]
-        video_filename = f"{uuid.uuid4()}.{file_extension}"
-        file_path = f"uploads/lessons/{video_filename}"
-        
-        # Save the file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(video_file.file, buffer)
+        # Upload new video to B2
+        b2_video_url, video_filename = await upload_to_b2(video_file, "lessons")
         
         lesson.video_filename = video_filename
-        lesson.video_url = f"/uploads/lessons/{video_filename}"
+        lesson.video_url = b2_video_url
     
     db.commit()
     db.refresh(lesson)
@@ -796,10 +827,6 @@ async def update_lesson(
         "video_url": lesson.video_url,
         "video_filename": lesson.video_filename
     }
-    
-    # If there's an uploaded video file, provide the URL
-    if lesson.video_filename:
-        response_data["video_url"] = f"/uploads/lessons/{lesson.video_filename}"
     
     return response_data
 
@@ -854,7 +881,7 @@ def delete_module(
 
 # Delete a lesson
 @app.delete("/lessons/{lesson_id}")
-def delete_lesson(
+async def delete_lesson(
     lesson_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -870,11 +897,9 @@ def delete_lesson(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
     
-    # Remove associated video file if it exists
+    # Remove associated video file from B2 if it exists
     if lesson.video_filename:
-        file_path = f"uploads/lessons/{lesson.video_filename}"
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        await delete_from_b2(lesson.video_filename)
     
     db.delete(lesson)
     db.commit()
