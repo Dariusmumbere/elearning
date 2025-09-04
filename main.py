@@ -287,6 +287,35 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
+# Add this function to your main.py file (before the app routes)
+def add_image_filename_column():
+    """Add the image_filename column to the courses table if it doesn't exist"""
+    from sqlalchemy import text
+    
+    db = SessionLocal()
+    try:
+        # Check if the column already exists
+        result = db.execute(text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='courses' AND column_name='image_filename'
+        """))
+        
+        if not result.fetchone():
+            # Add the column if it doesn't exist
+            db.execute(text("ALTER TABLE courses ADD COLUMN image_filename VARCHAR"))
+            db.commit()
+            print("Successfully added image_filename column to courses table")
+        else:
+            print("image_filename column already exists in courses table")
+            
+    except Exception as e:
+        db.rollback()
+        print(f"Error adding image_filename column: {e}")
+    finally:
+        db.close()
+        
+add_image_filename_column()
 # B2 Helper Functions
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
     """Upload a file to Backblaze B2 and return the URL"""
