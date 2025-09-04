@@ -1,6 +1,5 @@
-# main.py (FastAPI backend with Backblaze B2 integration - PRIVATE BUCKET)
-
-from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request
+# main.py (Updated with video streaming endpoint)
+from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
@@ -20,6 +19,8 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 import boto3
 from botocore.exceptions import ClientError
 import io
+import requests
+from urllib.parse import quote
 
 # Backblaze B2 Configuration - PRIVATE BUCKET
 B2_BUCKET_NAME = "uploads-dir"
@@ -42,7 +43,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database Models
+# Database Models (same as before)
 class UserModel(Base):
     __tablename__ = "users"
     
@@ -67,7 +68,7 @@ class CourseModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_published = Column(Boolean, default=False)
     image_url = Column(String, nullable=True)
-    image_filename = Column(String, nullable=True)  # NEW: Store B2 filename
+    image_filename = Column(String, nullable=True)
     
     instructor = relationship("UserModel", back_populates="courses")
     modules = relationship("ModuleModel", back_populates="course")
@@ -126,7 +127,7 @@ class ProgressModel(Base):
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-# Pydantic models
+# Pydantic models (same as before)
 class UserBase(BaseModel):
     email: EmailStr
     full_name: str
@@ -213,10 +214,15 @@ class LessonResponse(BaseModel):
     class Config:
         orm_mode = True
 
+class VideoTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+VIDEO_TOKEN_EXPIRE_MINUTES = 60  # Shorter lifespan for video tokens
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -267,6 +273,16 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+def create_video_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=VIDEO_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -287,35 +303,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
-# Add this function to your main.py file (before the app routes)
-def add_image_filename_column():
-    """Add the image_filename column to the courses table if it doesn't exist"""
-    from sqlalchemy import text
-    
-    db = SessionLocal()
-    try:
-        # Check if the column already exists
-        result = db.execute(text("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name='courses' AND column_name='image_filename'
-        """))
-        
-        if not result.fetchone():
-            # Add the column if it doesn't exist
-            db.execute(text("ALTER TABLE courses ADD COLUMN image_filename VARCHAR"))
-            db.commit()
-            print("Successfully added image_filename column to courses table")
-        else:
-            print("image_filename column already exists in courses table")
-            
-    except Exception as e:
-        db.rollback()
-        print(f"Error adding image_filename column: {e}")
-    finally:
-        db.close()
-        
-add_image_filename_column()
 # B2 Helper Functions
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
     """Upload a file to Backblaze B2 and return the URL"""
@@ -361,6 +348,159 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         return url
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
+
+# NEW: Video Streaming Endpoint
+@app.get("/stream/video/{filename}")
+async def stream_video(
+    filename: str,
+    token: str = Query(..., description="JWT token for video access"),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Verify the video token
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        lesson_id = payload.get("lesson_id")
+        
+        if not user_id or not lesson_id:
+            raise HTTPException(status_code=401, detail="Invalid video token")
+        
+        # Verify user has access to this lesson
+        user = db.query(UserModel).filter(UserModel.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+        if not lesson:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+        
+        # Check if user is enrolled in the course
+        enrollment = db.query(EnrollmentModel).filter(
+            EnrollmentModel.user_id == user_id,
+            EnrollmentModel.course_id == lesson.module.course_id
+        ).first()
+        
+        if not enrollment:
+            raise HTTPException(status_code=403, detail="Not enrolled in this course")
+        
+        # Verify the filename matches the lesson's video
+        if lesson.video_filename != filename:
+            raise HTTPException(status_code=403, detail="Invalid video access")
+        
+        # Generate a presigned URL for the video
+        video_url = await generate_presigned_url(filename, expiration=3600)  # 1 hour expiration
+        
+        # Use range requests for streaming
+        range_header = request.headers.get('Range')
+        
+        if range_header:
+            # Handle range requests for seeking
+            try:
+                # Parse the range header
+                range_type, range_value = range_header.split('=')
+                if range_type != 'bytes':
+                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+                
+                start, end = range_value.split('-')
+                start = int(start) if start else 0
+                end = int(end) if end else None
+                
+                # Get the object from B2 with range
+                response = b2_client.get_object(
+                    Bucket=B2_BUCKET_NAME,
+                    Key=filename,
+                    Range=f'bytes={start}-{end}' if end else f'bytes={start}-'
+                )
+                
+                # Stream the response
+                def iterfile():
+                    for chunk in response['Body'].iter_chunks():
+                        yield chunk
+                
+                headers = {
+                    'Content-Range': f'bytes {start}-{end if end else response["ContentLength"]-1}/{response["ContentLength"]}',
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(response['ContentLength']),
+                    'Content-Type': response['ContentType']
+                }
+                
+                return StreamingResponse(
+                    iterfile(),
+                    status_code=206,
+                    headers=headers,
+                    media_type=response['ContentType']
+                )
+                
+            except ClientError as e:
+                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
+        
+        else:
+            # Full video request
+            try:
+                response = b2_client.get_object(
+                    Bucket=B2_BUCKET_NAME,
+                    Key=filename
+                )
+                
+                def iterfile():
+                    for chunk in response['Body'].iter_chunks():
+                        yield chunk
+                
+                headers = {
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(response['ContentLength']),
+                    'Content-Type': response['ContentType']
+                }
+                
+                return StreamingResponse(
+                    iterfile(),
+                    headers=headers,
+                    media_type=response['ContentType']
+                )
+                
+            except ClientError as e:
+                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
+    
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired video token")
+
+# NEW: Get video access token endpoint
+@app.get("/video-token/{lesson_id}", response_model=VideoTokenResponse)
+async def get_video_token(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Verify user has access to this lesson
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Check if user is enrolled in the course
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Create a video token
+    expires_delta = timedelta(minutes=VIDEO_TOKEN_EXPIRE_MINUTES)
+    token_data = {
+        "sub": "video_access",
+        "user_id": current_user.id,
+        "lesson_id": lesson_id
+    }
+    access_token = create_video_token(token_data, expires_delta=expires_delta)
+    
+    return {
+        "token": access_token,
+        "expires_at": datetime.utcnow() + expires_delta
+    }
+
+# All the existing routes from your previous implementation...
+# (Auth routes, course routes, module routes, lesson routes, etc.)
 
 # Auth routes
 @app.post("/token", response_model=Token)
@@ -536,7 +676,7 @@ def get_course_modules(
     modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
     return modules
 
-# Lesson routes - UPDATED for Backblaze B2 integration
+# Lesson routes
 @app.post("/modules/{module_id}/lessons/", response_model=LessonResponse)
 async def create_lesson(
     module_id: int,
