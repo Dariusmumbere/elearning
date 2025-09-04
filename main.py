@@ -1230,6 +1230,39 @@ def check_enrollment_status(
     
     return {"is_enrolled": enrollment is not None}
 
+@app.get("/lessons/{lesson_id}/video-token", response_model=VideoTokenResponse)
+async def get_video_token(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Verify user has access to this lesson
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Check if user is enrolled in the course
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Create a video token
+    expires_delta = timedelta(minutes=VIDEO_TOKEN_EXPIRE_MINUTES)
+    token_data = {
+        "sub": "video_access",
+        "user_id": current_user.id,
+        "lesson_id": lesson_id
+    }
+    access_token = create_video_token(token_data, expires_delta=expires_delta)
+    
+    return {
+        "token": access_token,
+        "expires_at": datetime.utcnow() + expires_delta
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
