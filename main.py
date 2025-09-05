@@ -22,12 +22,20 @@ import io
 import requests
 from urllib.parse import quote
 import logging
+import google.generativeai as genai
+import json
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Gemini configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Backblaze B2 Configuration - PRIVATE BUCKET
 B2_BUCKET_NAME = "uploads-dir"
@@ -64,6 +72,48 @@ class UserModel(Base):
     
     courses = relationship("CourseModel", back_populates="instructor")
     enrollments = relationship("EnrollmentModel", back_populates="user")
+
+# Quiz Models
+class QuizModel(Base):
+    __tablename__ = "quizzes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    lesson_id = Column(Integer, ForeignKey("lessons.id"))
+    title = Column(String)
+    description = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    lesson = relationship("LessonModel")
+    questions = relationship("QuizQuestionModel", back_populates="quiz")
+
+class QuizQuestionModel(Base):
+    __tablename__ = "quiz_questions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    quiz_id = Column(Integer, ForeignKey("quizzes.id"))
+    question = Column(Text)
+    options = Column(Text)  # JSON string of options
+    correct_answer = Column(Integer)  # Index of correct option (0-based)
+    explanation = Column(Text, nullable=True)
+    
+    quiz = relationship("QuizModel", back_populates="questions")
+    attempts = relationship("QuizAttemptModel", back_populates="question")
+
+class QuizAttemptModel(Base):
+    __tablename__ = "quiz_attempts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    quiz_id = Column(Integer, ForeignKey("quizzes.id"))
+    question_id = Column(Integer, ForeignKey("quiz_questions.id"))
+    selected_option = Column(Integer)  # Index of selected option
+    is_correct = Column(Boolean)
+    attempted_at = Column(DateTime, default=datetime.utcnow)
+    
+    user = relationship("UserModel")
+    quiz = relationship("QuizModel")
+    question = relationship("QuizQuestionModel", back_populates="attempts")
+
 
 class CourseModel(Base):
     __tablename__ = "courses"
@@ -225,6 +275,59 @@ class VideoTokenResponse(BaseModel):
     token: str
     expires_at: datetime
 
+class QuizQuestionBase(BaseModel):
+    question: str
+    options: List[str]
+    correct_answer: int
+    explanation: Optional[str] = None
+
+class QuizQuestionCreate(QuizQuestionBase):
+    pass
+
+class QuizQuestion(QuizQuestionBase):
+    id: int
+    quiz_id: int
+    
+    class Config:
+        orm_mode = True
+
+class QuizBase(BaseModel):
+    title: str
+    description: Optional[str] = None
+
+class QuizCreate(QuizBase):
+    lesson_id: int
+
+class Quiz(QuizBase):
+    id: int
+    lesson_id: int
+    created_at: datetime
+    questions: List[QuizQuestion] = []
+    
+    class Config:
+        orm_mode = True
+
+class QuizAttemptBase(BaseModel):
+    question_id: int
+    selected_option: int
+
+class QuizAttemptCreate(QuizAttemptBase):
+    pass
+
+class QuizAttemptResponse(BaseModel):
+    is_correct: bool
+    explanation: Optional[str] = None
+    score: int
+    total_questions: int
+    passed: bool
+
+class QuizSummary(BaseModel):
+    quiz_id: int
+    score: int
+    total_questions: int
+    passed: bool
+    attempts: List[dict]
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
@@ -309,6 +412,71 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     if user is None:
         raise credentials_exception
     return user
+
+def generate_quiz_with_gemini(lesson_content: str, num_questions: int = 5) -> List[QuizQuestionCreate]:
+    """
+    Generate quiz questions using Gemini AI based on lesson content
+    """
+    prompt = f"""
+    Based on the following lesson content, generate {num_questions} multiple-choice questions with 4 options each.
+    Return ONLY a valid JSON array with this exact structure:
+    [
+        {{
+            "question": "Question text here",
+            "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+            "correct_answer": 0,  // index of correct option (0-3)
+            "explanation": "Brief explanation of why this is correct"
+        }},
+        // more questions...
+    ]
+    
+    Lesson Content:
+    {lesson_content[:3000]}  // Limit content length to avoid token limits
+    
+    Important: Return ONLY the JSON array, no other text.
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Clean the response to extract only JSON
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            questions_data = json.loads(json_match.group())
+            
+            # Validate the structure
+            validated_questions = []
+            for q in questions_data:
+                if (isinstance(q, dict) and 
+                    'question' in q and 
+                    'options' in q and 
+                    len(q['options']) == 4 and 
+                    'correct_answer' in q and 
+                    0 <= q['correct_answer'] < 4):
+                    
+                    validated_questions.append(QuizQuestionCreate(
+                        question=q['question'],
+                        options=q['options'],
+                        correct_answer=q['correct_answer'],
+                        explanation=q.get('explanation', '')
+                    ))
+            
+            return validated_questions
+        else:
+            raise ValueError("No valid JSON found in response")
+            
+    except Exception as e:
+        print(f"Error generating quiz with Gemini: {e}")
+        # Fallback to some default questions
+        return [
+            QuizQuestionCreate(
+                question="What was the main topic of this lesson?",
+                options=["Option A", "Option B", "Option C", "Option D"],
+                correct_answer=0,
+                explanation="This is a fallback question."
+            )
+        ]
 
 # B2 Helper Functions
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
@@ -1433,6 +1601,251 @@ async def get_video_token(
         "expires_at": datetime.utcnow() + expires_delta
     }
 
+@app.post("/lessons/{lesson_id}/generate-quiz", response_model=Quiz)
+async def generate_quiz_for_lesson(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Generate a quiz for a lesson using AI
+    """
+    logger.info(f"Generating quiz for lesson: {lesson_id} by user: {current_user.email}")
+    
+    if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to generate quiz: {current_user.email}")
+        raise HTTPException(status_code=403, detail="Only instructors can generate quizzes")
+    
+    # Get the lesson
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Check if quiz already exists
+    existing_quiz = db.query(QuizModel).filter(QuizModel.lesson_id == lesson_id).first()
+    if existing_quiz:
+        logger.info(f"Quiz already exists for lesson: {lesson_id}")
+        return existing_quiz
+    
+    # Generate questions using AI
+    questions = generate_quiz_with_gemini(lesson.content or lesson.title)
+    
+    # Create the quiz
+    db_quiz = QuizModel(
+        lesson_id=lesson_id,
+        title=f"Quiz for {lesson.title}",
+        description="AI-generated quiz based on lesson content"
+    )
+    db.add(db_quiz)
+    db.commit()
+    db.refresh(db_quiz)
+    
+    # Add questions
+    for i, question in enumerate(questions):
+        db_question = QuizQuestionModel(
+            quiz_id=db_quiz.id,
+            question=question.question,
+            options=json.dumps(question.options),
+            correct_answer=question.correct_answer,
+            explanation=question.explanation
+        )
+        db.add(db_question)
+    
+    db.commit()
+    db.refresh(db_quiz)
+    
+    logger.info(f"Quiz generated successfully for lesson: {lesson_id}")
+    return db_quiz
+
+@app.get("/lessons/{lesson_id}/quiz", response_model=Quiz)
+async def get_lesson_quiz(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the quiz for a lesson
+    """
+    logger.info(f"Fetching quiz for lesson: {lesson_id} by user: {current_user.email}")
+    
+    # Check if user is enrolled in the course
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"Not enrolled in course: {lesson.module.course_id} for user: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Get the quiz
+    quiz = db.query(QuizModel).filter(QuizModel.lesson_id == lesson_id).first()
+    if not quiz:
+        logger.error(f"Quiz not found for lesson: {lesson_id}")
+        raise HTTPException(status_code=404, detail="Quiz not found for this lesson")
+    
+    # Format the response with questions
+    quiz_data = {
+        "id": quiz.id,
+        "lesson_id": quiz.lesson_id,
+        "title": quiz.title,
+        "description": quiz.description,
+        "created_at": quiz.created_at,
+        "questions": []
+    }
+    
+    questions = db.query(QuizQuestionModel).filter(QuizQuestionModel.quiz_id == quiz.id).all()
+    for question in questions:
+        quiz_data["questions"].append({
+            "id": question.id,
+            "quiz_id": question.quiz_id,
+            "question": question.question,
+            "options": json.loads(question.options),
+            "correct_answer": question.correct_answer,
+            "explanation": question.explanation
+        })
+    
+    logger.info(f"Quiz found for lesson: {lesson_id}")
+    return quiz_data
+
+@app.post("/quiz/{quiz_id}/attempt", response_model=QuizAttemptResponse)
+async def submit_quiz_attempt(
+    quiz_id: int,
+    answers: List[QuizAttemptCreate],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Submit quiz answers and get results
+    """
+    logger.info(f"Submitting quiz attempt for quiz: {quiz_id} by user: {current_user.email}")
+    
+    # Get the quiz
+    quiz = db.query(QuizModel).filter(QuizModel.id == quiz_id).first()
+    if not quiz:
+        logger.error(f"Quiz not found: {quiz_id}")
+        raise HTTPException(status_code=404, detail="Quiz not found")
+    
+    # Check if user is enrolled in the course
+    lesson = db.query(LessonModel).filter(LessonModel.id == quiz.lesson_id).first()
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"Not enrolled in course: {lesson.module.course_id} for user: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Get all questions for this quiz
+    questions = db.query(QuizQuestionModel).filter(QuizQuestionModel.quiz_id == quiz_id).all()
+    total_questions = len(questions)
+    
+    if len(answers) != total_questions:
+        logger.error(f"Number of answers ({len(answers)}) doesn't match number of questions ({total_questions})")
+        raise HTTPException(status_code=400, detail="Number of answers doesn't match number of questions")
+    
+    # Check answers and record attempts
+    score = 0
+    attempts = []
+    
+    for answer in answers:
+        question = db.query(QuizQuestionModel).filter(QuizQuestionModel.id == answer.question_id).first()
+        if not question or question.quiz_id != quiz_id:
+            logger.error(f"Question not found or doesn't belong to quiz: {answer.question_id}")
+            continue
+        
+        is_correct = (answer.selected_option == question.correct_answer)
+        if is_correct:
+            score += 1
+        
+        # Record the attempt
+        attempt = QuizAttemptModel(
+            user_id=current_user.id,
+            quiz_id=quiz_id,
+            question_id=answer.question_id,
+            selected_option=answer.selected_option,
+            is_correct=is_correct
+        )
+        db.add(attempt)
+        attempts.append({
+            "question_id": answer.question_id,
+            "selected_option": answer.selected_option,
+            "is_correct": is_correct,
+            "explanation": question.explanation
+        })
+    
+    db.commit()
+    
+    # Check if user passed (at least 3/5 correct)
+    passed = score >= 3
+    
+    logger.info(f"Quiz attempt submitted for quiz: {quiz_id}, score: {score}/{total_questions}, passed: {passed}")
+    
+    return {
+        "is_correct": passed,  # For the last question
+        "explanation": f"You scored {score} out of {total_questions}. {'You passed!' if passed else 'You need at least 3 correct answers to pass.'}",
+        "score": score,
+        "total_questions": total_questions,
+        "passed": passed
+    }
+
+@app.get("/quiz/{quiz_id}/summary", response_model=QuizSummary)
+async def get_quiz_summary(
+    quiz_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get summary of user's quiz attempts
+    """
+    logger.info(f"Fetching quiz summary for quiz: {quiz_id} by user: {current_user.email}")
+    
+    # Get the quiz
+    quiz = db.query(QuizModel).filter(QuizModel.id == quiz_id).first()
+    if not quiz:
+        logger.error(f"Quiz not found: {quiz_id}")
+        raise HTTPException(status_code=404, detail="Quiz not found")
+    
+    # Get all attempts for this user and quiz
+    attempts = db.query(QuizAttemptModel).filter(
+        QuizAttemptModel.user_id == current_user.id,
+        QuizAttemptModel.quiz_id == quiz_id
+    ).all()
+    
+    # Calculate score
+    total_questions = db.query(QuizQuestionModel).filter(QuizQuestionModel.quiz_id == quiz_id).count()
+    correct_answers = sum(1 for attempt in attempts if attempt.is_correct)
+    passed = correct_answers >= 3
+    
+    # Format attempts
+    attempt_details = []
+    for attempt in attempts:
+        question = db.query(QuizQuestionModel).filter(QuizQuestionModel.id == attempt.question_id).first()
+        attempt_details.append({
+            "question_id": attempt.question_id,
+            "question_text": question.question if question else "Unknown question",
+            "selected_option": attempt.selected_option,
+            "correct_option": question.correct_answer if question else -1,
+            "is_correct": attempt.is_correct,
+            "explanation": question.explanation if question else ""
+        })
+    
+    logger.info(f"Quiz summary found for quiz: {quiz_id}, score: {correct_answers}/{total_questions}")
+    
+    return {
+        "quiz_id": quiz_id,
+        "score": correct_answers,
+        "total_questions": total_questions,
+        "passed": passed,
+        "attempts": attempt_details
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
