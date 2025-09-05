@@ -386,6 +386,8 @@ async def stream_video(
             raise HTTPException(status_code=403, detail="Not enrolled in this course")
         
         # Verify the filename matches the lesson's video
+        print(f"filename in path: {filename}")
+        print(f"lesson.video_filename: {lesson.video_filename}")
         if lesson.video_filename != filename:
             raise HTTPException(status_code=403, detail="Invalid video access")
         
