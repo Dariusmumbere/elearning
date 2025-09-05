@@ -420,6 +420,7 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
 # Quiz Helper Functions
+# Replace your current generate_quiz function with this:
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
     """Generate a quiz using Gemini AI based on lesson content"""
     try:
@@ -437,6 +438,8 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             ]
         }}
         The correct_answer should be the index (0-3) of the correct option.
+        
+        IMPORTANT: Make sure the questions are directly related to the content and test actual understanding.
         
         Lesson Content:
         {lesson_content}
@@ -457,6 +460,15 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             
             # Validate the structure
             if "questions" in quiz_data and len(quiz_data["questions"]) == 5:
+                # Validate each question has the correct structure
+                for i, question in enumerate(quiz_data["questions"]):
+                    if not all(key in question for key in ["question", "options", "correct_answer"]):
+                        raise ValueError(f"Question {i+1} missing required fields")
+                    if len(question["options"]) != 4:
+                        raise ValueError(f"Question {i+1} doesn't have exactly 4 options")
+                    if not 0 <= question["correct_answer"] <= 3:
+                        raise ValueError(f"Question {i+1} has invalid correct_answer index")
+                
                 return quiz_data["questions"]
             else:
                 raise ValueError("Invalid quiz format from AI")
@@ -486,7 +498,6 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             }
             for i in range(5)
         ]
-
 # NEW: Robust Video Streaming Endpoint with Debugging Logs
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
@@ -712,6 +723,7 @@ async def get_video_token(
     }
 
 # NEW: Quiz Endpoints
+# Replace your current generate_quiz_for_lesson endpoint with this:
 @app.post("/lessons/{lesson_id}/generate-quiz", response_model=QuizResponse)
 async def generate_quiz_for_lesson(
     lesson_id: int,
@@ -720,7 +732,7 @@ async def generate_quiz_for_lesson(
 ):
     logger.info(f"Generating quiz for lesson {lesson_id} by user {current_user.id}")
     
-    # Verify user has access to this lesson
+    # Verify user has access to this lesson and get lesson content
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         logger.error(f"Lesson not found: {lesson_id}")
@@ -736,11 +748,17 @@ async def generate_quiz_for_lesson(
         logger.error(f"User {current_user.id} not enrolled in course {lesson.module.course_id}")
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
     
-    # Generate quiz using AI
+    # Check if lesson has content to generate quiz from
+    if not lesson.content or lesson.content.strip() == "":
+        logger.error(f"Lesson {lesson_id} has no content to generate quiz from")
+        raise HTTPException(status_code=400, detail="Lesson has no content to generate quiz from")
+    
+    # Generate quiz using AI with the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
     return {"questions": quiz_questions}
 
+# Replace your current submit_quiz endpoint with this:
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
 async def submit_quiz(
     lesson_id: int,
@@ -750,7 +768,7 @@ async def submit_quiz(
 ):
     logger.info(f"Submitting quiz for lesson {lesson_id} by user {current_user.id}")
     
-    # Verify user has access to this lesson
+    # Verify user has access to this lesson and get lesson content
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         logger.error(f"Lesson not found: {lesson_id}")
@@ -766,7 +784,7 @@ async def submit_quiz(
         logger.error(f"User {current_user.id} not enrolled in course {lesson.module.course_id}")
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
     
-    # Generate the same quiz again to get correct answers
+    # Generate the same quiz again to get correct answers using the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
     # Calculate score
