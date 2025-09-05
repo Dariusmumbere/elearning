@@ -11,3 +11,4 @@ email-validator
 boto3 
 botocore
 requests
+google-generativeai
