@@ -354,7 +354,7 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
 @app.get("/stream/video/{filename}")
 async def stream_video(
     filename: str,
-    range: str = Header(None),
+    request: Request,  # Add this parameter
     token: str = Query(..., description="JWT token for video access"),
     db: Session = Depends(get_db)
 ):
@@ -389,70 +389,76 @@ async def stream_video(
         if lesson.video_filename != filename:
             raise HTTPException(status_code=403, detail="Invalid video access")
         
-        # Get the object from B2
-        try:
-            response = b2_client.get_object(
-                Bucket=B2_BUCKET_NAME,
-                Key=filename
-            )
-        except ClientError as e:
-            raise HTTPException(status_code=404, detail="Video file not found")
+        # Use range requests for streaming
+        range_header = request.headers.get('Range')
         
-        # Get file size
-        file_size = response['ContentLength']
+        if range_header:
+            # Handle range requests for seeking
+            try:
+                # Parse the range header
+                range_type, range_value = range_header.split('=')
+                if range_type != 'bytes':
+                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+                
+                start, end = range_value.split('-')
+                start = int(start) if start else 0
+                end = int(end) if end else None
+                
+                # Get the object from B2 with range
+                response = b2_client.get_object(
+                    Bucket=B2_BUCKET_NAME,
+                    Key=filename,
+                    Range=f'bytes={start}-{end}' if end else f'bytes={start}-'
+                )
+                
+                # Stream the response
+                def iterfile():
+                    for chunk in response['Body'].iter_chunks():
+                        yield chunk
+                
+                headers = {
+                    'Content-Range': f'bytes {start}-{end if end else response["ContentLength"]-1}/{response["ContentLength"]}',
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(response['ContentLength']),
+                    'Content-Type': response['ContentType']
+                }
+                
+                return StreamingResponse(
+                    iterfile(),
+                    status_code=206,
+                    headers=headers,
+                    media_type=response['ContentType']
+                )
+                
+            except ClientError as e:
+                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
         
-        # Handle range requests for video seeking
-        if range:
-            range = range.replace("bytes=", "")
-            start, end = range.split("-")
-            start = int(start)
-            end = int(end) if end else file_size - 1
-            
-            if start >= file_size:
-                raise HTTPException(status_code=416, detail="Requested range not satisfiable")
-            
-            # Get the specific range from B2
-            range_response = b2_client.get_object(
-                Bucket=B2_BUCKET_NAME,
-                Key=filename,
-                Range=f"bytes={start}-{end}"
-            )
-            
-            content_length = end - start + 1
-            headers = {
-                'Content-Range': f'bytes {start}-{end}/{file_size}',
-                'Accept-Ranges': 'bytes',
-                'Content-Length': str(content_length),
-                'Content-Type': response['ContentType']
-            }
-            
-            def iterfile():
-                for chunk in range_response['Body'].iter_chunks(chunk_size=8192):
-                    yield chunk
-            
-            return StreamingResponse(
-                iterfile(),
-                status_code=206,
-                headers=headers,
-                media_type=response['ContentType']
-            )
         else:
-            # Full file request
-            headers = {
-                'Accept-Ranges': 'bytes',
-                'Content-Length': str(file_size),
-                'Content-Type': response['ContentType']
-            }
-            
-            def iterfile():
-                for chunk in response['Body'].iter_chunks(chunk_size=8192):
-                    yield chunk
-            
-            return StreamingResponse(
-                iterfile(),
-                headers=headers,
-                media_type=response['ContentType']
-            )
+            # Full video request
+            try:
+                response = b2_client.get_object(
+                    Bucket=B2_BUCKET_NAME,
+                    Key=filename
+                )
+                
+                def iterfile():
+                    for chunk in response['Body'].iter_chunks():
+                        yield chunk
+                
+                headers = {
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(response['ContentLength']),
+                    'Content-Type': response['ContentType']
+                }
+                
+                return StreamingResponse(
+                    iterfile(),
+                    headers=headers,
+                    media_type=response['ContentType']
+                )
+                
+            except ClientError as e:
+                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
     
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
