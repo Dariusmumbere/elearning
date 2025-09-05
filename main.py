@@ -158,6 +158,7 @@ class QuizAttemptModel(Base):
     lesson = relationship("LessonModel", back_populates="quiz_attempts")
 
 # Create tables
+Base.metadata.create_all(bind=engine)
 
 # Pydantic models (updated with quiz models)
 class UserBase(BaseModel):
@@ -283,9 +284,6 @@ class QuizAttemptResponse(BaseModel):
     
     class Config:
         orm_mode = True
-        
-Base.metadata.drop_all(bind=engine, cascade=True)
-Base.metadata.create_all(bind=engine)
 
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -887,7 +885,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 async def create_course(
     title: str = Form(...),
     description: str = Form(None),
-    image_file: Optional[UploadFile] = File(None),
+    image_file: Optional[UploadFile = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
