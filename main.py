@@ -1,4 +1,4 @@
-# main.py (Updated with video streaming endpoint)
+# main.py (Updated with robust video streaming endpoint)
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -21,6 +21,11 @@ from botocore.exceptions import ClientError
 import io
 import requests
 from urllib.parse import quote
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -351,15 +356,17 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
-# NEW: Video Streaming Endpoint
-# Replace the current stream_video endpoint with this corrected version
-@router.get("/stream/video/{filename:path}")
+# NEW: Robust Video Streaming Endpoint with Debugging Logs
+@app.get("/stream/video/{filename:path}")
 async def stream_video(
     filename: str,
     request: Request,
     token: str = Query(..., description="JWT token for video access"),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Video streaming request received for filename: {filename}")
+    logger.info(f"Token received: {token[:20]}...")  # Log first 20 chars of token
+    
     try:
         # Decode token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -367,23 +374,26 @@ async def stream_video(
         lesson_id = payload.get("lesson_id")
 
         # Debug logs
-        print("[Debug] Token payload:", payload)
-        print("[Debug] Requested filename:", filename)
+        logger.info(f"Token payload: {payload}")
+        logger.info(f"Requested filename: {filename}")
 
         if not user_id or not lesson_id:
+            logger.error("Invalid video token: missing user_id or lesson_id")
             raise HTTPException(status_code=401, detail="Invalid video token")
 
         # Fetch user and lesson
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
+            logger.error(f"User not found with ID: {user_id}")
             raise HTTPException(status_code=401, detail="User not found")
 
         lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
         if not lesson:
+            logger.error(f"Lesson not found with ID: {lesson_id}")
             raise HTTPException(status_code=404, detail="Lesson not found")
 
         # Debug log
-        print("[Debug] Lesson filename from DB:", lesson.video_filename)
+        logger.info(f"Lesson filename from DB: {lesson.video_filename}")
 
         # Check enrollment
         enrollment = db.query(EnrollmentModel).filter(
@@ -392,6 +402,7 @@ async def stream_video(
         ).first()
 
         if not enrollment:
+            logger.error(f"User {user_id} not enrolled in course {lesson.module.course_id}")
             raise HTTPException(status_code=403, detail="Not enrolled in this course")
 
         # Compare filenames (robust check using pathlib)
@@ -399,27 +410,34 @@ async def stream_video(
         expected_filename = Path(lesson.video_filename).name
 
         if requested_filename != expected_filename:
+            logger.error(f"Filename mismatch: requested {requested_filename}, expected {expected_filename}")
             raise HTTPException(status_code=403, detail="Invalid video access")
 
         # Confirm file exists in B2 before streaming
         try:
             b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
-            print("[Debug] File exists in B2!")
+            logger.info("File exists in B2!")
         except ClientError as e:
-            print("[Debug] B2 HEAD Error:", e)
+            logger.error(f"B2 HEAD Error: {e}")
             raise HTTPException(status_code=404, detail="Video file not found in B2")
 
         object_key = lesson.video_filename
         range_header = request.headers.get("Range")
+        logger.info(f"Range header: {range_header}")
 
         def stream_body(response_body):
-            for chunk in response_body.iter_chunks():
-                yield chunk
+            try:
+                for chunk in response_body.iter_chunks():
+                    yield chunk
+            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                raise
 
         if range_header:
             try:
                 range_type, range_value = range_header.split('=')
                 if range_type.strip().lower() != 'bytes':
+                    logger.error(f"Invalid range type: {range_type}")
                     raise HTTPException(status_code=416, detail="Invalid Range Type")
 
                 start_str, end_str = range_value.split('-')
@@ -427,6 +445,7 @@ async def stream_video(
                 end = int(end_str) if end_str else None
 
                 byte_range = f"bytes={start}-{end}" if end else f"bytes={start}-"
+                logger.info(f"Byte range: {byte_range}")
 
                 response = b2_client.get_object(
                     Bucket=B2_BUCKET_NAME,
@@ -444,6 +463,7 @@ async def stream_video(
                     'Content-Type': content_type
                 }
 
+                logger.info(f"Streaming range response with headers: {headers}")
                 return StreamingResponse(
                     stream_body(response['Body']),
                     status_code=206,
@@ -452,12 +472,13 @@ async def stream_video(
                 )
 
             except ClientError as e:
-                print("[Debug] Range Streaming Error:", e)
+                logger.error(f"Range Streaming Error: {e}")
                 raise HTTPException(status_code=500, detail="Error streaming video (range)")
 
         # Full video stream
         try:
             response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
+            logger.info(f"Full video response received, content length: {response['ContentLength']}")
 
             headers = {
                 'Accept-Ranges': 'bytes',
@@ -465,6 +486,7 @@ async def stream_video(
                 'Content-Type': response['ContentType']
             }
 
+            logger.info(f"Streaming full video with headers: {headers}")
             return StreamingResponse(
                 stream_body(response['Body']),
                 headers=headers,
@@ -472,13 +494,15 @@ async def stream_video(
             )
 
         except ClientError as e:
-            print("[Debug] Full Streaming Error:", e)
+            logger.error(f"Full Streaming Error: {e}")
             raise HTTPException(status_code=500, detail="Error streaming video")
 
     except JWTError as e:
-        print("[Debug] JWT Decode Error:", e)
+        logger.error(f"JWT Decode Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
-        
+    except Exception as e:
+        logger.error(f"Unexpected error in stream_video: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # NEW: Get video access token endpoint
 @app.get("/video-token/{lesson_id}", response_model=VideoTokenResponse)
@@ -487,9 +511,12 @@ async def get_video_token(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Video token request for lesson {lesson_id} from user {current_user.id}")
+    
     # Verify user has access to this lesson
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
     
     # Check if user is enrolled in the course
@@ -499,6 +526,7 @@ async def get_video_token(
     ).first()
     
     if not enrollment:
+        logger.error(f"User {current_user.id} not enrolled in course {lesson.module.course_id}")
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
     
     # Create a video token
@@ -510,6 +538,7 @@ async def get_video_token(
     }
     access_token = create_video_token(token_data, expires_delta=expires_delta)
     
+    logger.info(f"Video token generated for user {current_user.id}, lesson {lesson_id}")
     return {
         "token": access_token,
         "expires_at": datetime.utcnow() + expires_delta
@@ -521,8 +550,10 @@ async def get_video_token(
 # Auth routes
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    logger.info(f"Login attempt for user: {form_data.username}")
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
+        logger.error(f"Failed login attempt for user: {form_data.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -532,12 +563,15 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     access_token = create_access_token(
         data={"sub": user.email}, expires_delta=access_token_expires
     )
+    logger.info(f"Successful login for user: {form_data.username}")
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/users/", response_model=User)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    logger.info(f"Creating new user: {user.email}")
     db_user = get_user_by_email(db, email=user.email)
     if db_user:
+        logger.error(f"User already exists: {user.email}")
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_password = get_password_hash(user.password)
     db_user = UserModel(
@@ -549,10 +583,12 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+    logger.info(f"User created successfully: {user.email}")
     return db_user
 
 @app.get("/users/me/", response_model=User)
 async def read_users_me(current_user: User = Depends(get_current_user)):
+    logger.info(f"User data requested for: {current_user.email}")
     return current_user
 
 # Course routes
@@ -564,7 +600,9 @@ async def create_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Creating course: {title} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to create course: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can create courses")
     
     # Handle image upload if provided
@@ -573,6 +611,7 @@ async def create_course(
         # Validate file type
         allowed_image_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         if image_file.content_type not in allowed_image_types:
+            logger.error(f"Invalid image type: {image_file.content_type}")
             raise HTTPException(
                 status_code=400, 
                 detail="Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed."
@@ -580,6 +619,7 @@ async def create_course(
         
         # Upload to Backblaze B2
         image_filename = await upload_to_b2(image_file, "courses")
+        logger.info(f"Course image uploaded: {image_filename}")
     
     db_course = CourseModel(
         title=title,
@@ -607,10 +647,12 @@ async def create_course(
         "image_url": image_url
     }
     
+    logger.info(f"Course created successfully: {db_course.id}")
     return course_data
 
 @app.get("/courses/", response_model=List[Course])
 async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    logger.info(f"Fetching courses, skip: {skip}, limit: {limit}")
     courses = db.query(CourseModel).filter(CourseModel.is_published == True).offset(skip).limit(limit).all()
     
     # Convert ORM objects to dicts and generate presigned URLs for images
@@ -631,12 +673,15 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
         }
         course_list.append(course_dict)
     
+    logger.info(f"Returning {len(course_list)} courses")
     return course_list
 
 @app.get("/courses/{course_id}", response_model=Course)
 async def read_course(course_id: int, db: Session = Depends(get_db)):
+    logger.info(f"Fetching course: {course_id}")
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if course is None:
+        logger.error(f"Course not found: {course_id}")
         raise HTTPException(status_code=404, detail="Course not found")
     
     # Generate presigned URL for the image
@@ -655,6 +700,7 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
         "image_url": image_url
     }
     
+    logger.info(f"Course found: {course_id}")
     return course_data
 
 # Module routes
@@ -665,11 +711,14 @@ def create_module(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Creating module for course: {course_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to create module: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can create modules")
     
     course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
     if not course:
+        logger.error(f"Course not found or permission denied: {course_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
     
     db_module = ModuleModel(
@@ -681,6 +730,7 @@ def create_module(
     db.add(db_module)
     db.commit()
     db.refresh(db_module)
+    logger.info(f"Module created successfully: {db_module.id}")
     return db_module
 
 # Get modules for a course
@@ -689,7 +739,9 @@ def get_course_modules(
     course_id: int,
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching modules for course: {course_id}")
     modules = db.query(ModuleModel).filter(ModuleModel.course_id == course_id).order_by(ModuleModel.order).all()
+    logger.info(f"Found {len(modules)} modules for course: {course_id}")
     return modules
 
 # Lesson routes
@@ -703,7 +755,9 @@ async def create_lesson(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Creating lesson for module: {module_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to create lesson: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can create lessons")
     
     # Verify the module exists and belongs to the current instructor
@@ -713,6 +767,7 @@ async def create_lesson(
     ).first()
     
     if not module:
+        logger.error(f"Module not found or permission denied: {module_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
     # Handle video file upload if provided
@@ -723,6 +778,7 @@ async def create_lesson(
         # Validate file type
         allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
         if video_file.content_type not in allowed_video_types:
+            logger.error(f"Invalid video type: {video_file.content_type}")
             raise HTTPException(
                 status_code=400, 
                 detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
@@ -731,6 +787,7 @@ async def create_lesson(
         # Upload to Backblaze B2
         video_filename = await upload_to_b2(video_file, "lessons")
         video_url = await generate_presigned_url(video_filename)
+        logger.info(f"Video uploaded: {video_filename}")
     
     # Create the lesson
     db_lesson = LessonModel(
@@ -757,6 +814,7 @@ async def create_lesson(
         "video_filename": db_lesson.video_filename
     }
     
+    logger.info(f"Lesson created successfully: {db_lesson.id}")
     return response_data
 
 # Get lessons for a module
@@ -766,6 +824,7 @@ async def get_module_lessons(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching lessons for module: {module_id} by user: {current_user.email}")
     lessons = db.query(LessonModel).filter(LessonModel.module_id == module_id).order_by(LessonModel.order).all()
     
     # Check if user is enrolled in this course
@@ -805,6 +864,7 @@ async def get_module_lessons(
             
         response_lessons.append(lesson_data)
     
+    logger.info(f"Returning {len(response_lessons)} lessons for module: {module_id}")
     return response_lessons
 
 # Publish course
@@ -814,15 +874,19 @@ def publish_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Publishing course: {course_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to publish course: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can publish courses")
     
     course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
     if not course:
+        logger.error(f"Course not found or permission denied: {course_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
     
     course.is_published = True
     db.commit()
+    logger.info(f"Course published successfully: {course_id}")
     return {"message": "Course published successfully"}
 
 # File upload to B2
@@ -831,7 +895,9 @@ async def upload_course_image(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
+    logger.info(f"Uploading course image by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to upload image: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can upload images")
     
     # Upload to Backblaze B2
@@ -840,6 +906,7 @@ async def upload_course_image(
     # Generate presigned URL
     url = await generate_presigned_url(filename)
     
+    logger.info(f"Image uploaded successfully: {filename}")
     return {"filename": filename, "url": url}
 
 # Enrollment routes
@@ -849,8 +916,10 @@ def enroll_in_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Enrolling user {current_user.email} in course: {course_id}")
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
+        logger.error(f"Course not found: {course_id}")
         raise HTTPException(status_code=404, detail="Course not found")
     
     existing_enrollment = db.query(EnrollmentModel).filter(
@@ -859,12 +928,14 @@ def enroll_in_course(
     ).first()
     
     if existing_enrollment:
+        logger.error(f"User already enrolled: {current_user.email} in course: {course_id}")
         raise HTTPException(status_code=400, detail="Already enrolled in this course")
     
     enrollment = EnrollmentModel(user_id=current_user.id, course_id=course_id)
     db.add(enrollment)
     db.commit()
     
+    logger.info(f"User enrolled successfully: {current_user.email} in course: {course_id}")
     return {"message": "Successfully enrolled in course"}
 
 @app.get("/my-courses/", response_model=List[Course])
@@ -872,6 +943,7 @@ async def get_my_courses(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching courses for user: {current_user.email}")
     enrollments = db.query(EnrollmentModel).filter(EnrollmentModel.user_id == current_user.id).all()
     course_ids = [enrollment.course_id for enrollment in enrollments]
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
@@ -894,6 +966,7 @@ async def get_my_courses(
         }
         course_list.append(course_dict)
     
+    logger.info(f"Returning {len(course_list)} courses for user: {current_user.email}")
     return course_list
 
 # Get courses for the current instructor
@@ -902,7 +975,9 @@ async def get_instructor_courses(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching instructor courses for user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to access instructor courses: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
     
     courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
@@ -925,6 +1000,7 @@ async def get_instructor_courses(
         }
         course_list.append(course_dict)
     
+    logger.info(f"Returning {len(course_list)} instructor courses for user: {current_user.email}")
     return course_list
 
 # Update course endpoint
@@ -937,11 +1013,14 @@ async def update_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Updating course: {course_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to update course: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can update courses")
     
     course = db.query(CourseModel).filter(CourseModel.id == course_id, CourseModel.instructor_id == current_user.id).first()
     if not course:
+        logger.error(f"Course not found or permission denied: {course_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Course not found or you don't have permission")
     
     if title is not None:
@@ -954,6 +1033,7 @@ async def update_course(
         # Validate file type
         allowed_image_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         if image_file.content_type not in allowed_image_types:
+            logger.error(f"Invalid image type: {image_file.content_type}")
             raise HTTPException(
                 status_code=400, 
                 detail="Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed."
@@ -985,6 +1065,7 @@ async def update_course(
         "image_url": image_url
     }
     
+    logger.info(f"Course updated successfully: {course_id}")
     return course_response
 
 # Get a specific lesson
@@ -993,8 +1074,10 @@ async def get_lesson(
     lesson_id: int,
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching lesson: {lesson_id}")
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
     
     # Generate presigned URL for video if it exists
@@ -1012,6 +1095,7 @@ async def get_lesson(
         "video_filename": lesson.video_filename
     }
     
+    logger.info(f"Lesson found: {lesson_id}")
     return response_data
 
 # Update a lesson
@@ -1025,7 +1109,9 @@ async def update_lesson(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Updating lesson: {lesson_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to update lesson: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can update lessons")
     
     lesson = db.query(LessonModel).join(ModuleModel).join(CourseModel).filter(
@@ -1034,6 +1120,7 @@ async def update_lesson(
     ).first()
     
     if not lesson:
+        logger.error(f"Lesson not found or permission denied: {lesson_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
     
     # Update fields if provided
@@ -1049,6 +1136,7 @@ async def update_lesson(
         # Validate file type
         allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
         if video_file.content_type not in allowed_video_types:
+            logger.error(f"Invalid video type: {video_file.content_type}")
             raise HTTPException(
                 status_code=400, 
                 detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed."
@@ -1076,6 +1164,7 @@ async def update_lesson(
         "video_filename": lesson.video_filename
     }
     
+    logger.info(f"Lesson updated successfully: {lesson_id}")
     return response_data
 
 # Update a module
@@ -1086,7 +1175,9 @@ def update_module(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Updating module: {module_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to update module: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can update modules")
     
     module = db.query(ModuleModel).join(CourseModel).filter(
@@ -1095,6 +1186,7 @@ def update_module(
     ).first()
     
     if not module:
+        logger.error(f"Module not found or permission denied: {module_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
     module.title = module_data.title
@@ -1103,6 +1195,7 @@ def update_module(
     
     db.commit()
     db.refresh(module)
+    logger.info(f"Module updated successfully: {module_id}")
     return module
 
 # Delete a module
@@ -1112,7 +1205,9 @@ def delete_module(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Deleting module: {module_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to delete module: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can delete modules")
     
     module = db.query(ModuleModel).join(CourseModel).filter(
@@ -1121,10 +1216,12 @@ def delete_module(
     ).first()
     
     if not module:
+        logger.error(f"Module not found or permission denied: {module_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
     db.delete(module)
     db.commit()
+    logger.info(f"Module deleted successfully: {module_id}")
     return {"message": "Module deleted successfully"}
 
 # Delete a lesson
@@ -1134,7 +1231,9 @@ async def delete_lesson(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Deleting lesson: {lesson_id} by user: {current_user.email}")
     if not current_user.is_instructor:
+        logger.error(f"Non-instructor attempt to delete lesson: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can delete lessons")
     
     lesson = db.query(LessonModel).join(ModuleModel).join(CourseModel).filter(
@@ -1143,6 +1242,7 @@ async def delete_lesson(
     ).first()
     
     if not lesson:
+        logger.error(f"Lesson not found or permission denied: {lesson_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Lesson not found or you don't have permission")
     
     # Remove associated video file from B2 if it exists
@@ -1151,6 +1251,7 @@ async def delete_lesson(
     
     db.delete(lesson)
     db.commit()
+    logger.info(f"Lesson deleted successfully: {lesson_id}")
     return {"message": "Lesson deleted successfully"}
 
 # Progress tracking endpoints
@@ -1160,9 +1261,11 @@ def mark_lesson_complete(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Marking lesson complete: {lesson_id} by user: {current_user.email}")
     # Find the enrollment for this user and course
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
     
     enrollment = db.query(EnrollmentModel).filter(
@@ -1171,6 +1274,7 @@ def mark_lesson_complete(
     ).first()
     
     if not enrollment:
+        logger.error(f"Not enrolled in course: {lesson.module.course_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Not enrolled in this course")
     
     # Check if progress already exists
@@ -1181,6 +1285,7 @@ def mark_lesson_complete(
     
     if progress:
         # Already completed
+        logger.info(f"Lesson already completed: {lesson_id} by user: {current_user.email}")
         return {"message": "Lesson already completed"}
     
     # Create new progress record
@@ -1193,6 +1298,7 @@ def mark_lesson_complete(
     db.add(progress)
     db.commit()
     
+    logger.info(f"Lesson marked as complete: {lesson_id} by user: {current_user.email}")
     return {"message": "Lesson marked as complete"}
 
 @app.get("/progress/course/{course_id}")
@@ -1201,12 +1307,14 @@ def get_course_progress(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Fetching progress for course: {course_id} by user: {current_user.email}")
     enrollment = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id,
         EnrollmentModel.course_id == course_id
     ).first()
     
     if not enrollment:
+        logger.error(f"Not enrolled in course: {course_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Not enrolled in this course")
     
     # Get all lessons in the course
@@ -1227,6 +1335,7 @@ def get_course_progress(
     
     progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
     
+    logger.info(f"Progress for course {course_id}: {completed_lessons}/{total_lessons} ({progress_percentage:.2f}%)")
     return {
         "total_lessons": total_lessons,
         "completed_lessons": completed_lessons,
@@ -1239,12 +1348,15 @@ def check_enrollment_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Checking enrollment for course: {course_id} by user: {current_user.email}")
     enrollment = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id,
         EnrollmentModel.course_id == course_id
     ).first()
     
-    return {"is_enrolled": enrollment is not None}
+    is_enrolled = enrollment is not None
+    logger.info(f"Enrollment status for course {course_id}: {is_enrolled}")
+    return {"is_enrolled": is_enrolled}
 
 @app.get("/lessons/{lesson_id}/video-token", response_model=VideoTokenResponse)
 async def get_video_token(
@@ -1252,9 +1364,11 @@ async def get_video_token(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Video token request for lesson: {lesson_id} by user: {current_user.email}")
     # Verify user has access to this lesson
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
     
     # Check if user is enrolled in the course
@@ -1264,6 +1378,7 @@ async def get_video_token(
     ).first()
     
     if not enrollment:
+        logger.error(f"Not enrolled in course: {lesson.module.course_id} for user: {current_user.id}")
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
     
     # Create a video token
@@ -1275,10 +1390,12 @@ async def get_video_token(
     }
     access_token = create_video_token(token_data, expires_delta=expires_delta)
     
+    logger.info(f"Video token generated for lesson: {lesson_id} by user: {current_user.email}")
     return {
         "token": access_token,
         "expires_at": datetime.utcnow() + expires_delta
     }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
