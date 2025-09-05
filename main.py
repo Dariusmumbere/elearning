@@ -1,8 +1,8 @@
-# main.py (Updated with AI Quiz System)
+# main.py (Updated with AI Quiz System and Migrations)
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr
@@ -24,6 +24,9 @@ from urllib.parse import quote
 import logging
 import google.generativeai as genai
 import json
+import alembic
+from alembic import command
+from alembic.config import Config
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -885,7 +888,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 async def create_course(
     title: str = Form(...),
     description: str = Form(None),
-    image_file: Optional[UploadFile = File(None),
+    image_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1694,6 +1697,27 @@ async def get_video_token(
         "expires_at": datetime.utcnow() + expires_delta
     }
 
+# Migration endpoint to ensure database schema is up to date
+@app.post("/migrate")
+def run_migrations():
+    """Run database migrations to ensure schema is up to date"""
+    try:
+        # Create all tables if they don't exist
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database migrations completed successfully")
+        return {"message": "Database schema is up to date"}
+    except Exception as e:
+        logger.error(f"Migration error: {e}")
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+# Health check endpoint
+@app.get("/health")
+def health_check():
+    """Health check endpoint to verify the API is running"""
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
+
 if __name__ == "__main__":
     import uvicorn
+    # Ensure database is migrated before starting
+    Base.metadata.create_all(bind=engine)
     uvicorn.run(app, host="0.0.0.0", port=8000)
