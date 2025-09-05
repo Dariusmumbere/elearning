@@ -531,7 +531,7 @@ def add_missing_columns(db: Session):
         logger.error(f"Error adding missing columns: {e}")
         raise
 
-add_missing_columns()
+add_missing_columns(db)
 # NEW: Robust Video Streaming Endpoint with Debugging Logs
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
