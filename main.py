@@ -1693,7 +1693,34 @@ async def get_video_token(
         "token": access_token,
         "expires_at": datetime.utcnow() + expires_delta
     }
-
+# Add this function to your main.py file
+def add_has_quiz_column():
+    """Add the has_quiz column to the lessons table if it doesn't exist"""
+    from sqlalchemy import text
+    
+    db = SessionLocal()
+    try:
+        # Check if the column already exists
+        result = db.execute(text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'lessons' AND column_name = 'has_quiz'
+        """))
+        
+        if result.fetchone() is None:
+            # Column doesn't exist, add it
+            db.execute(text("ALTER TABLE lessons ADD COLUMN has_quiz BOOLEAN DEFAULT FALSE"))
+            db.commit()
+            logger.info("Added has_quiz column to lessons table")
+        else:
+            logger.info("has_quiz column already exists in lessons table")
+            
+    except Exception as e:
+        logger.error(f"Error adding has_quiz column: {e}")
+        db.rollback()
+    finally:
+        db.close()
+add_has_quiz_column()
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
