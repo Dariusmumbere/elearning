@@ -158,7 +158,6 @@ class QuizAttemptModel(Base):
     lesson = relationship("LessonModel", back_populates="quiz_attempts")
 
 # Create tables
-Base.metadata.create_all(bind=engine)
 
 # Pydantic models (updated with quiz models)
 class UserBase(BaseModel):
@@ -285,7 +284,7 @@ class QuizAttemptResponse(BaseModel):
     class Config:
         orm_mode = True
         
-Base.metadata.drop_all(bind=engine)
+Base.metadata.drop_all(bind=engine, cascade=True)
 Base.metadata.create_all(bind=engine)
 
 # Auth setup
