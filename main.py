@@ -357,6 +357,7 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
 # NEW: Robust Video Streaming Endpoint with Debugging Logs
+# Replace the current stream_video endpoint with this corrected version
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
     filename: str,
@@ -415,8 +416,10 @@ async def stream_video(
 
         # Confirm file exists in B2 before streaming
         try:
-            b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
-            logger.info("File exists in B2!")
+            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
+            file_size = head_response['ContentLength']
+            content_type = head_response['ContentType']
+            logger.info(f"File exists in B2! Size: {file_size} bytes, Type: {content_type}")
         except ClientError as e:
             logger.error(f"B2 HEAD Error: {e}")
             raise HTTPException(status_code=404, detail="Video file not found in B2")
@@ -425,16 +428,10 @@ async def stream_video(
         range_header = request.headers.get("Range")
         logger.info(f"Range header: {range_header}")
 
-        def stream_body(response_body):
-            try:
-                for chunk in response_body.iter_chunks():
-                    yield chunk
-            except Exception as e:
-                logger.error(f"Streaming error: {e}")
-                raise
-
+        # Handle range requests
         if range_header:
             try:
+                # Parse range header
                 range_type, range_value = range_header.split('=')
                 if range_type.strip().lower() != 'bytes':
                     logger.error(f"Invalid range type: {range_type}")
@@ -442,30 +439,51 @@ async def stream_video(
 
                 start_str, end_str = range_value.split('-')
                 start = int(start_str) if start_str else 0
-                end = int(end_str) if end_str else None
+                end = int(end_str) if end_str else file_size - 1
 
-                byte_range = f"bytes={start}-{end}" if end else f"bytes={start}-"
-                logger.info(f"Byte range: {byte_range}")
+                # Validate range
+                if start >= file_size or end >= file_size or start > end:
+                    logger.error(f"Invalid range: {start}-{end} for file size {file_size}")
+                    raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
 
+                # Calculate content length
+                content_length = end - start + 1
+                byte_range = f"bytes={start}-{end}"
+
+                logger.info(f"Requesting byte range: {byte_range}, content length: {content_length}")
+
+                # Get the range from B2
                 response = b2_client.get_object(
                     Bucket=B2_BUCKET_NAME,
                     Key=object_key,
                     Range=byte_range
                 )
 
-                content_length = int(response['ContentLength'])
-                content_type = response['ContentType']
-
                 headers = {
-                    'Content-Range': f'bytes {start}-{start + content_length - 1}/{response["ContentLength"]}',
+                    'Content-Range': f'bytes {start}-{end}/{file_size}',
                     'Accept-Ranges': 'bytes',
                     'Content-Length': str(content_length),
                     'Content-Type': content_type
                 }
 
                 logger.info(f"Streaming range response with headers: {headers}")
+
+                # Stream the response in chunks
+                def generate_chunks():
+                    try:
+                        chunk_size = 1024 * 1024  # 1MB chunks
+                        with response['Body'] as stream:
+                            while True:
+                                chunk = stream.read(chunk_size)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except Exception as e:
+                        logger.error(f"Error during chunk streaming: {e}")
+                        raise
+
                 return StreamingResponse(
-                    stream_body(response['Body']),
+                    generate_chunks(),
                     status_code=206,
                     headers=headers,
                     media_type=content_type
@@ -474,23 +492,41 @@ async def stream_video(
             except ClientError as e:
                 logger.error(f"Range Streaming Error: {e}")
                 raise HTTPException(status_code=500, detail="Error streaming video (range)")
+            except ValueError as e:
+                logger.error(f"Invalid range format: {e}")
+                raise HTTPException(status_code=416, detail="Invalid Range Format")
 
-        # Full video stream
+        # Full video stream (if no range header)
         try:
+            logger.info("No range header, streaming full video")
             response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
-            logger.info(f"Full video response received, content length: {response['ContentLength']}")
 
             headers = {
                 'Accept-Ranges': 'bytes',
-                'Content-Length': str(response['ContentLength']),
-                'Content-Type': response['ContentType']
+                'Content-Length': str(file_size),
+                'Content-Type': content_type
             }
 
             logger.info(f"Streaming full video with headers: {headers}")
+
+            # Stream the response in chunks
+            def generate_full_chunks():
+                try:
+                    chunk_size = 1024 * 1024  # 1MB chunks
+                    with response['Body'] as stream:
+                        while True:
+                            chunk = stream.read(chunk_size)
+                            if not chunk:
+                                break
+                            yield chunk
+                except Exception as e:
+                    logger.error(f"Error during full video streaming: {e}")
+                    raise
+
             return StreamingResponse(
-                stream_body(response['Body']),
+                generate_full_chunks(),
                 headers=headers,
-                media_type=response['ContentType']
+                media_type=content_type
             )
 
         except ClientError as e:
@@ -503,6 +539,7 @@ async def stream_video(
     except Exception as e:
         logger.error(f"Unexpected error in stream_video: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+        
 
 # NEW: Get video access token endpoint
 @app.get("/video-token/{lesson_id}", response_model=VideoTokenResponse)
