@@ -486,52 +486,7 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             }
             for i in range(5)
         ]
-def add_missing_columns(db: Session):
-    """Add missing columns to existing tables based on model definitions"""
-    try:
-        # Define the expected columns for each table
-        expected_columns = {
-            'quiz_attempts': ['lesson_id'],
-            # Add other tables and columns as needed
-        }
-        
-        for table_name, columns in expected_columns.items():
-            for column_name in columns:
-                # Check if column exists
-                result = db.execute(text(f"""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = '{table_name}' AND column_name = '{column_name}'
-                """))
-                
-                if not result.fetchone():
-                    # Get column info from the model
-                    table = Base.metadata.tables.get(table_name)
-                    if table and column_name in table.columns:
-                        column = table.columns[column_name]
-                        column_type = str(column.type)
-                        
-                        # Handle foreign key constraints
-                        fk_constraint = ""
-                        for fk in column.foreign_keys:
-                            fk_constraint = f" REFERENCES {fk.target_fullname.split('.')[0]}({fk.target_fullname.split('.')[1]})"
-                        
-                        # Add the column
-                        db.execute(text(f"""
-                            ALTER TABLE {table_name} 
-                            ADD COLUMN {column_name} {column_type}{fk_constraint}
-                        """))
-                        logger.info(f"Added missing {column_name} column to {table_name} table")
-        
-        db.commit()
-        logger.info("Database schema check completed")
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error adding missing columns: {e}")
-        raise
 
-add_missing_columns(db)
 # NEW: Robust Video Streaming Endpoint with Debugging Logs
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
