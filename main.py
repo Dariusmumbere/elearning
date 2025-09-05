@@ -1,5 +1,5 @@
 # main.py (Updated with video streaming endpoint)
-from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
@@ -21,6 +21,8 @@ from botocore.exceptions import ClientError
 import io
 import requests
 from urllib.parse import quote
+
+router = APIRouter()
 
 # Backblaze B2 Configuration - PRIVATE BUCKET
 B2_BUCKET_NAME = "uploads-dir"
@@ -351,118 +353,116 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
 
 # NEW: Video Streaming Endpoint
 # Replace the current stream_video endpoint with this corrected version
-@app.get("/stream/video/{filename}")
+@router.get("/stream/video/{filename:path}")
 async def stream_video(
     filename: str,
-    request: Request,  # Add this parameter
+    request: Request,
     token: str = Query(..., description="JWT token for video access"),
     db: Session = Depends(get_db)
 ):
     try:
-        # Verify the video token
+        # Decode JWT token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("user_id")
         lesson_id = payload.get("lesson_id")
-        
+
         if not user_id or not lesson_id:
             raise HTTPException(status_code=401, detail="Invalid video token")
-        
-        # Verify user has access to this lesson
+
+        # Get user and lesson
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        
+
         lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
         if not lesson:
             raise HTTPException(status_code=404, detail="Lesson not found")
-        
-        # Check if user is enrolled in the course
+
+        # Check enrollment
         enrollment = db.query(EnrollmentModel).filter(
             EnrollmentModel.user_id == user_id,
             EnrollmentModel.course_id == lesson.module.course_id
         ).first()
-        
+
         if not enrollment:
             raise HTTPException(status_code=403, detail="Not enrolled in this course")
-        
-        # Verify the filename matches the lesson's video
-        print(f"filename in path: {filename}")
-        print(f"lesson.video_filename: {lesson.video_filename}")
-        if lesson.video_filename != filename:
+
+        # Ensure requested file matches lesson video
+        requested_filename = Path(filename).name  # Strip path for comparison
+        expected_filename = Path(lesson.video_filename).name
+
+        if requested_filename != expected_filename:
             raise HTTPException(status_code=403, detail="Invalid video access")
-        
-        # Use range requests for streaming
+
+        # Try range-based streaming
         range_header = request.headers.get('Range')
-        
+        object_key = lesson.video_filename  # Full key/path in B2
+
+        def stream_body(response_body):
+            for chunk in response_body.iter_chunks():
+                yield chunk
+
         if range_header:
-            # Handle range requests for seeking
             try:
-                # Parse the range header
                 range_type, range_value = range_header.split('=')
-                if range_type != 'bytes':
+                if range_type.strip().lower() != 'bytes':
                     raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-                
-                start, end = range_value.split('-')
-                start = int(start) if start else 0
-                end = int(end) if end else None
-                
-                # Get the object from B2 with range
+
+                start_str, end_str = range_value.split('-')
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else None
+
+                byte_range = f"bytes={start}-{end}" if end else f"bytes={start}-"
+
                 response = b2_client.get_object(
                     Bucket=B2_BUCKET_NAME,
-                    Key=filename,
-                    Range=f'bytes={start}-{end}' if end else f'bytes={start}-'
+                    Key=object_key,
+                    Range=byte_range
                 )
-                
-                # Stream the response
-                def iterfile():
-                    for chunk in response['Body'].iter_chunks():
-                        yield chunk
-                
+
+                content_length = int(response['ContentLength'])
+                content_type = response['ContentType']
+
                 headers = {
-                    'Content-Range': f'bytes {start}-{end if end else response["ContentLength"]-1}/{response["ContentLength"]}',
+                    'Content-Range': f'bytes {start}-{start + content_length - 1}/{response["ContentLength"]}',
                     'Accept-Ranges': 'bytes',
-                    'Content-Length': str(response['ContentLength']),
-                    'Content-Type': response['ContentType']
+                    'Content-Length': str(content_length),
+                    'Content-Type': content_type
                 }
-                
+
                 return StreamingResponse(
-                    iterfile(),
+                    stream_body(response['Body']),
                     status_code=206,
                     headers=headers,
-                    media_type=response['ContentType']
+                    media_type=content_type
                 )
-                
+
             except ClientError as e:
-                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
-        
-        else:
-            # Full video request
-            try:
-                response = b2_client.get_object(
-                    Bucket=B2_BUCKET_NAME,
-                    Key=filename
-                )
-                
-                def iterfile():
-                    for chunk in response['Body'].iter_chunks():
-                        yield chunk
-                
-                headers = {
-                    'Accept-Ranges': 'bytes',
-                    'Content-Length': str(response['ContentLength']),
-                    'Content-Type': response['ContentType']
-                }
-                
-                return StreamingResponse(
-                    iterfile(),
-                    headers=headers,
-                    media_type=response['ContentType']
-                )
-                
-            except ClientError as e:
-                raise HTTPException(status_code=500, detail=f"Error streaming video: {str(e)}")
-    
-    except JWTError:
+                logging.error(f"B2 range stream error: {e}")
+                raise HTTPException(status_code=500, detail="Error streaming video with range")
+
+        # Fallback to full stream
+        try:
+            response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
+
+            headers = {
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(response['ContentLength']),
+                'Content-Type': response['ContentType']
+            }
+
+            return StreamingResponse(
+                stream_body(response['Body']),
+                headers=headers,
+                media_type=response['ContentType']
+            )
+
+        except ClientError as e:
+            logging.error(f"B2 full stream error: {e}")
+            raise HTTPException(status_code=404, detail="Video not found or inaccessible")
+
+    except JWTError as e:
+        logging.warning(f"JWT decode error: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
         
 
