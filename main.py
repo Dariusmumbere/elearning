@@ -361,15 +361,19 @@ async def stream_video(
     db: Session = Depends(get_db)
 ):
     try:
-        # Decode JWT token
+        # Decode token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("user_id")
         lesson_id = payload.get("lesson_id")
 
+        # Debug logs
+        print("[Debug] Token payload:", payload)
+        print("[Debug] Requested filename:", filename)
+
         if not user_id or not lesson_id:
             raise HTTPException(status_code=401, detail="Invalid video token")
 
-        # Get user and lesson
+        # Fetch user and lesson
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
@@ -377,6 +381,9 @@ async def stream_video(
         lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
         if not lesson:
             raise HTTPException(status_code=404, detail="Lesson not found")
+
+        # Debug log
+        print("[Debug] Lesson filename from DB:", lesson.video_filename)
 
         # Check enrollment
         enrollment = db.query(EnrollmentModel).filter(
@@ -387,16 +394,23 @@ async def stream_video(
         if not enrollment:
             raise HTTPException(status_code=403, detail="Not enrolled in this course")
 
-        # Ensure requested file matches lesson video
-        requested_filename = Path(filename).name  # Strip path for comparison
+        # Compare filenames (robust check using pathlib)
+        requested_filename = Path(filename).name
         expected_filename = Path(lesson.video_filename).name
 
         if requested_filename != expected_filename:
             raise HTTPException(status_code=403, detail="Invalid video access")
 
-        # Try range-based streaming
-        range_header = request.headers.get('Range')
-        object_key = lesson.video_filename  # Full key/path in B2
+        # Confirm file exists in B2 before streaming
+        try:
+            b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
+            print("[Debug] File exists in B2!")
+        except ClientError as e:
+            print("[Debug] B2 HEAD Error:", e)
+            raise HTTPException(status_code=404, detail="Video file not found in B2")
+
+        object_key = lesson.video_filename
+        range_header = request.headers.get("Range")
 
         def stream_body(response_body):
             for chunk in response_body.iter_chunks():
@@ -406,7 +420,7 @@ async def stream_video(
             try:
                 range_type, range_value = range_header.split('=')
                 if range_type.strip().lower() != 'bytes':
-                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+                    raise HTTPException(status_code=416, detail="Invalid Range Type")
 
                 start_str, end_str = range_value.split('-')
                 start = int(start_str) if start_str else 0
@@ -438,10 +452,10 @@ async def stream_video(
                 )
 
             except ClientError as e:
-                logging.error(f"B2 range stream error: {e}")
-                raise HTTPException(status_code=500, detail="Error streaming video with range")
+                print("[Debug] Range Streaming Error:", e)
+                raise HTTPException(status_code=500, detail="Error streaming video (range)")
 
-        # Fallback to full stream
+        # Full video stream
         try:
             response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
 
@@ -458,11 +472,11 @@ async def stream_video(
             )
 
         except ClientError as e:
-            logging.error(f"B2 full stream error: {e}")
-            raise HTTPException(status_code=404, detail="Video not found or inaccessible")
+            print("[Debug] Full Streaming Error:", e)
+            raise HTTPException(status_code=500, detail="Error streaming video")
 
     except JWTError as e:
-        logging.warning(f"JWT decode error: {e}")
+        print("[Debug] JWT Decode Error:", e)
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
         
 
