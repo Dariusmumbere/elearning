@@ -1,4 +1,3 @@
-# main.py (Updated with AI Quiz System and Migrations)
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -372,6 +371,39 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     if user is None:
         raise credentials_exception
     return user
+
+# Add this function to your backend
+def check_previous_lessons_completed(db: Session, enrollment_id: int, current_lesson: LessonModel):
+    """Check if all previous lessons in the module are completed"""
+    # Get all lessons in the current module, ordered by their order
+    all_lessons = db.query(LessonModel).filter(
+        LessonModel.module_id == current_lesson.module_id
+    ).order_by(LessonModel.order).all()
+    
+    # Find the current lesson's position
+    current_index = None
+    for i, lesson in enumerate(all_lessons):
+        if lesson.id == current_lesson.id:
+            current_index = i
+            break
+    
+    # If it's the first lesson, no previous lessons to check
+    if current_index == 0:
+        return True
+    
+    # Check if all previous lessons are completed
+    for i in range(current_index):
+        previous_lesson = all_lessons[i]
+        progress = db.query(ProgressModel).filter(
+            ProgressModel.enrollment_id == enrollment_id,
+            ProgressModel.lesson_id == previous_lesson.id,
+            ProgressModel.completed == True
+        ).first()
+        
+        if not progress:
+            return False
+    
+    return True
 
 # B2 Helper Functions
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
@@ -1728,6 +1760,196 @@ def run_migrations():
         logger.error(f"Migration error: {e}")
         raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
+@app.get("/lessons/{lesson_id}/access")
+def check_lesson_access(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Check if user can access this lesson (previous lessons completed)"""
+    logger.info(f"Checking access for lesson: {lesson_id} by user: {current_user.email}")
+    
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Check enrollment
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User not enrolled in course: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Check if previous lessons are completed
+    can_access = check_previous_lessons_completed(db, enrollment.id, lesson)
+    
+    # Get current lesson progress
+    current_progress = db.query(ProgressModel).filter(
+        ProgressModel.enrollment_id == enrollment.id,
+        ProgressModel.lesson_id == lesson_id
+    ).first()
+    
+    return {
+        "can_access": can_access,
+        "current_lesson_completed": current_progress.completed if current_progress else False,
+        "message": "Access granted" if can_access else "Complete previous lessons first"
+    }
+
+@app.get("/modules/{module_id}/total-score")
+def get_module_total_score(
+    module_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Calculate total score for all quizzes in a module"""
+    logger.info(f"Calculating total score for module: {module_id} by user: {current_user.email}")
+    
+    module = db.query(ModuleModel).filter(ModuleModel.id == module_id).first()
+    if not module:
+        logger.error(f"Module not found: {module_id}")
+        raise HTTPException(status_code=404, detail="Module not found")
+    
+    # Check enrollment
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == module.course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User not enrolled in course: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Get all lessons with quizzes in this module
+    lessons_with_quizzes = db.query(LessonModel).filter(
+        LessonModel.module_id == module_id,
+        LessonModel.has_quiz == True
+    ).all()
+    
+    total_score = 0
+    total_possible = 0
+    quiz_results = []
+    
+    for lesson in lessons_with_quizzes:
+        # Get the best quiz attempt for this lesson
+        best_attempt = db.query(QuizAttemptModel).filter(
+            QuizAttemptModel.user_id == current_user.id,
+            QuizAttemptModel.lesson_id == lesson.id
+        ).order_by(QuizAttemptModel.score.desc()).first()
+        
+        if best_attempt:
+            total_score += best_attempt.score
+            total_possible += 5  # Each quiz has 5 questions
+            quiz_results.append({
+                "lesson_id": lesson.id,
+                "lesson_title": lesson.title,
+                "score": best_attempt.score,
+                "passed": best_attempt.passed,
+                "attempt_date": best_attempt.created_at
+            })
+    
+    percentage = (total_score / total_possible * 100) if total_possible > 0 else 0
+    
+    return {
+        "module_id": module_id,
+        "module_title": module.title,
+        "total_score": total_score,
+        "total_possible": total_possible,
+        "percentage": percentage,
+        "quiz_results": quiz_results
+    }
+
+@app.get("/performance/course/{course_id}")
+def get_course_performance(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get comprehensive performance data for a course"""
+    logger.info(f"Getting performance data for course: {course_id} by user: {current_user.email}")
+    
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        logger.error(f"Course not found: {course_id}")
+        raise HTTPException(status_code=404, detail="Course not found")
+    
+    # Check enrollment
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User not enrolled in course: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Get progress data
+    progress_data = db.query(
+        ProgressModel.lesson_id,
+        ProgressModel.completed,
+        ProgressModel.completed_at
+    ).filter(ProgressModel.enrollment_id == enrollment.id).all()
+    
+    # Get quiz data
+    quiz_attempts = db.query(QuizAttemptModel).join(LessonModel).filter(
+        QuizAttemptModel.user_id == current_user.id,
+        LessonModel.module_id.in_([m.id for m in course.modules])
+    ).all()
+    
+    # Calculate module-wise scores
+    module_scores = []
+    for module in course.modules:
+        module_quiz_score = 0
+        module_total_possible = 0
+        
+        for lesson in module.lessons:
+            if lesson.has_quiz:
+                # Get best attempt for this lesson
+                best_attempt = None
+                for attempt in quiz_attempts:
+                    if attempt.lesson_id == lesson.id:
+                        if not best_attempt or attempt.score > best_attempt.score:
+                            best_attempt = attempt
+                
+                if best_attempt:
+                    module_quiz_score += best_attempt.score
+                    module_total_possible += 5
+        
+        module_percentage = (module_quiz_score / module_total_possible * 100) if module_total_possible > 0 else 0
+        
+        module_scores.append({
+            "module_id": module.id,
+            "module_title": module.title,
+            "quiz_score": module_quiz_score,
+            "total_possible": module_total_possible,
+            "percentage": module_percentage
+        })
+    
+    # Calculate overall progress
+    total_lessons = sum(len(module.lessons) for module in course.modules)
+    completed_lessons = len([p for p in progress_data if p.completed])
+    progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
+    
+    # Calculate overall quiz score
+    total_quiz_score = sum(ms["quiz_score"] for ms in module_scores)
+    total_quiz_possible = sum(ms["total_possible"] for ms in module_scores)
+    overall_quiz_percentage = (total_quiz_score / total_quiz_possible * 100) if total_quiz_possible > 0 else 0
+    
+    return {
+        "course_id": course_id,
+        "course_title": course.title,
+        "overall_progress": progress_percentage,
+        "completed_lessons": completed_lessons,
+        "total_lessons": total_lessons,
+        "overall_quiz_score": total_quiz_score,
+        "total_quiz_possible": total_quiz_possible,
+        "overall_quiz_percentage": overall_quiz_percentage,
+        "module_scores": module_scores,
+        "enrollment_date": enrollment.enrolled_at
+    }
 # Health check endpoint
 @app.get("/health")
 def health_check():
