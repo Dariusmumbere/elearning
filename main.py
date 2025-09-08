@@ -1916,7 +1916,8 @@ def get_course_performance(
                 
                 if best_attempt:
                     module_quiz_score += best_attempt.score
-                    module_total_possible += 5
+                # Each quiz has 5 questions, so max possible is 5
+                module_total_possible += 5
         
         module_percentage = (module_quiz_score / module_total_possible * 100) if module_total_possible > 0 else 0
         
