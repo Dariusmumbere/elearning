@@ -113,7 +113,7 @@ class LessonModel(Base):
     order = Column(Integer)
     video_url = Column(String, nullable=True)
     video_filename = Column(String, nullable=True)
-    has_quiz = Column(Boolean, default=False)
+    has_quiz = Column(Boolean, default=True)
     
     module = relationship("ModuleModel", back_populates="lessons")
     progress = relationship("ProgressModel", back_populates="lesson")
@@ -226,7 +226,7 @@ class LessonBase(BaseModel):
     content: Optional[str] = None
     order: int
     video_url: Optional[str] = None
-    has_quiz: Optional[bool] = False
+    has_quiz: Optional[bool] = True
 
 class LessonCreate(LessonBase):
     pass
