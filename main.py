@@ -9,12 +9,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Union
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-import os
 import shutil
 import uuid
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 import boto3
 from botocore.exceptions import ClientError
 import io
@@ -26,6 +25,9 @@ import json
 import alembic
 from alembic import command
 from alembic.config import Config
+import pdfkit
+import tempfile
+import os
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -1951,6 +1953,87 @@ def get_course_performance(
         "module_scores": module_scores,
         "enrollment_date": enrollment.enrolled_at
     }
+
+@app.get("/lessons/{lesson_id}/download-pdf")
+async def download_lesson_pdf(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Generate and download lesson content as PDF"""
+    logger.info(f"PDF download request for lesson: {lesson_id} by user: {current_user.email}")
+    
+    # Verify user has access to this lesson
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        logger.error(f"Lesson not found: {lesson_id}")
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Check if user is enrolled in the course
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User not enrolled in course: {current_user.id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Create HTML content for PDF
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>{lesson.title}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 40px; }}
+            h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+            .content {{ margin-top: 20px; }}
+            .footer {{ margin-top: 40px; text-align: center; color: #7f8c8d; font-size: 12px; }}
+        </style>
+    </head>
+    <body>
+        <h1>{lesson.title}</h1>
+        <div class="content">
+            {lesson.content or 'No content available for this lesson.'}
+        </div>
+        <div class="footer">
+            Generated on {datetime.now().strftime("%Y-%m-%d %H:%M")} | eLearning Platform
+        </div>
+    </body>
+    </html>
+    """
+    
+    try:
+        # Configure pdfkit (you might need to install wkhtmltopdf on your server)
+        config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')  # Adjust path as needed
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+            # Generate PDF
+            pdfkit.from_string(html_content, tmp_file.name, configuration=config)
+            
+            # Read the generated PDF
+            with open(tmp_file.name, 'rb') as f:
+                pdf_data = f.read()
+            
+            # Clean up
+            os.unlink(tmp_file.name)
+        
+        # Return PDF as downloadable file
+        return Response(
+            content=pdf_data,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={lesson.title.replace(' ', '_')}_notes.pdf",
+                "Content-Length": str(len(pdf_data))
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate PDF")
 # Health check endpoint
 @app.get("/health")
 def health_check():
