@@ -13,3 +13,4 @@ botocore
 requests
 google-generativeai
 alembic
+pdfkit
