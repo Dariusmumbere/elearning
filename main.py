@@ -28,6 +28,16 @@ from alembic.config import Config
 import pdfkit
 import tempfile
 import os
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+import base64
+from io import BytesIO
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -61,7 +71,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database Models (updated with quiz tables)
+# Database Models (updated with quiz tables and certificates)
 class UserModel(Base):
     __tablename__ = "users"
     
@@ -76,6 +86,7 @@ class UserModel(Base):
     courses = relationship("CourseModel", back_populates="instructor")
     enrollments = relationship("EnrollmentModel", back_populates="user")
     quiz_attempts = relationship("QuizAttemptModel", back_populates="user")
+    certificates = relationship("CertificateModel", back_populates="user")
 
 class CourseModel(Base):
     __tablename__ = "courses"
@@ -92,6 +103,7 @@ class CourseModel(Base):
     instructor = relationship("UserModel", back_populates="courses")
     modules = relationship("ModuleModel", back_populates="course")
     enrollments = relationship("EnrollmentModel", back_populates="course")
+    certificates = relationship("CertificateModel", back_populates="course")
 
 class ModuleModel(Base):
     __tablename__ = "modules"
@@ -145,7 +157,6 @@ class ProgressModel(Base):
     enrollment = relationship("EnrollmentModel", back_populates="progress")
     lesson = relationship("LessonModel", back_populates="progress")
 
-# New Quiz Models
 class QuizAttemptModel(Base):
     __tablename__ = "quiz_attempts"
     
@@ -161,10 +172,23 @@ class QuizAttemptModel(Base):
     user = relationship("UserModel", back_populates="quiz_attempts")
     lesson = relationship("LessonModel", back_populates="quiz_attempts")
 
+class CertificateModel(Base):
+    __tablename__ = "certificates"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    course_id = Column(Integer, ForeignKey("courses.id"))
+    issued_at = Column(DateTime, default=datetime.utcnow)
+    certificate_hash = Column(String, unique=True, index=True)
+    pdf_filename = Column(String, nullable=True)
+    
+    user = relationship("UserModel", back_populates="certificates")
+    course = relationship("CourseModel", back_populates="certificates")
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-# Pydantic models (updated with quiz models)
+# Pydantic models (updated with quiz models and certificates)
 class UserBase(BaseModel):
     email: EmailStr
     full_name: str
@@ -289,6 +313,27 @@ class QuizAttemptResponse(BaseModel):
     
     class Config:
         orm_mode = True
+
+# Certificate Models
+class CertificateResponse(BaseModel):
+    id: int
+    user_id: int
+    course_id: int
+    issued_at: datetime
+    certificate_hash: str
+    download_url: Optional[str] = None
+    
+    class Config:
+        orm_mode = True
+
+class CertificateEligibilityResponse(BaseModel):
+    eligible: bool
+    completed_lessons: int
+    total_lessons: int
+    progress_percentage: float
+    message: Optional[str] = None
+    existing_certificate: Optional[CertificateResponse] = None
+
 def migrate_has_quiz_default(db: Session):
     """
     Migration function to ensure all lessons have has_quiz set to True by default.
@@ -573,6 +618,163 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             }
             for i in range(5)
         ]
+
+# Certificate Helper Functions
+def generate_certificate_hash(user_id: int, course_id: int) -> str:
+    """Generate a unique hash for the certificate"""
+    unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}"
+    return hashlib.sha256(unique_string.encode()).hexdigest()
+
+def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
+    """Create a visually appealing certificate PDF"""
+    buffer = BytesIO()
+    
+    # Create the PDF document
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    
+    # Container for the 'Flowable' objects
+    elements = []
+    
+    # Add styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Title'],
+        fontSize=36,
+        spaceAfter=30,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#2C3E50')
+    )
+    
+    subtitle_style = ParagraphStyle(
+        'CustomSubtitle',
+        parent=styles['Heading2'],
+        fontSize=24,
+        spaceAfter=20,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#34495E')
+    )
+    
+    normal_style = ParagraphStyle(
+        'CustomNormal',
+        parent=styles['Normal'],
+        fontSize=16,
+        spaceAfter=12,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#7F8C8D')
+    )
+    
+    name_style = ParagraphStyle(
+        'CustomName',
+        parent=styles['Heading1'],
+        fontSize=42,
+        spaceAfter=30,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#2980B9')
+    )
+    
+    # Add certificate content
+    elements.append(Spacer(1, 50))
+    
+    # Certificate title
+    elements.append(Paragraph("CERTIFICATE OF COMPLETION", title_style))
+    elements.append(Spacer(1, 20))
+    
+    # This certifies that
+    elements.append(Paragraph("This is to certify that", normal_style))
+    elements.append(Spacer(1, 10))
+    
+    # Student name
+    elements.append(Paragraph(user.full_name.upper(), name_style))
+    elements.append(Spacer(1, 20))
+    
+    # Completion text
+    elements.append(Paragraph("has successfully completed the course", normal_style))
+    elements.append(Spacer(1, 20))
+    
+    # Course title
+    elements.append(Paragraph(f'"{course.title}"', subtitle_style))
+    elements.append(Spacer(1, 30))
+    
+    # Date of completion
+    completion_date = datetime.utcnow().strftime("%B %d, %Y")
+    elements.append(Paragraph(f"Awarded on {completion_date}", normal_style))
+    elements.append(Spacer(1, 40))
+    
+    # Signature area
+    signature_data = [
+        ["_________________________", "_________________________"],
+        ["Course Instructor", "Platform Director"]
+    ]
+    
+    signature_table = Table(signature_data, colWidths=[3*inch, 3*inch])
+    signature_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTSIZE', (0, 0), (-1, -1), 12),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#7F8C8D')),
+    ]))
+    
+    elements.append(signature_table)
+    elements.append(Spacer(1, 30))
+    
+    # Certificate ID
+    elements.append(Paragraph(f"Certificate ID: {certificate_hash}", 
+                             ParagraphStyle('CustomSmall', 
+                                           parent=styles['Normal'], 
+                                           fontSize=10, 
+                                           alignment=TA_CENTER,
+                                           textColor=colors.HexColor('#BDC3C7'))))
+    
+    # Build PDF
+    doc.build(elements)
+    
+    # Reset buffer position
+    buffer.seek(0)
+    return buffer
+
+async def upload_certificate_to_b2(pdf_buffer: BytesIO, filename: str) -> str:
+    """Upload certificate PDF to Backblaze B2"""
+    try:
+        # Upload to B2
+        b2_client.put_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=filename,
+            Body=pdf_buffer.getvalue(),
+            ContentType='application/pdf'
+        )
+        
+        return filename
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading certificate: {str(e)}")
+
+def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
+    """Check if a user has completed all lessons in a course"""
+    # Get all lessons in the course
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        return False, 0, 0
+    
+    total_lessons = 0
+    completed_lessons = 0
+    
+    for module in course.modules:
+        total_lessons += len(module.lessons)
+        for lesson in module.lessons:
+            # Check if user has completed this lesson
+            progress = db.query(ProgressModel).join(EnrollmentModel).filter(
+                EnrollmentModel.user_id == user_id,
+                EnrollmentModel.course_id == course_id,
+                ProgressModel.lesson_id == lesson.id,
+                ProgressModel.completed == True
+            ).first()
+            
+            if progress:
+                completed_lessons += 1
+    
+    progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
+    return completed_lessons == total_lessons, completed_lessons, total_lessons, progress_percentage
+
 # NEW: Robust Video Streaming Endpoint with Debugging Logs
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
@@ -931,6 +1133,226 @@ async def get_quiz_attempts(
     
     return attempts
 
+# NEW: Certificate Endpoints
+@app.get("/courses/{course_id}/certificate/eligibility", response_model=CertificateEligibilityResponse)
+async def check_certificate_eligibility(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Check if a user is eligible to claim a certificate for a course"""
+    logger.info(f"Checking certificate eligibility for course {course_id} by user {current_user.id}")
+    
+    # Check if user is enrolled in the course
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User {current_user.id} not enrolled in course {course_id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Check if user already has a certificate for this course
+    existing_certificate = db.query(CertificateModel).filter(
+        CertificateModel.user_id == current_user.id,
+        CertificateModel.course_id == course_id
+    ).first()
+    
+    if existing_certificate:
+        logger.info(f"User {current_user.id} already has a certificate for course {course_id}")
+        # Generate download URL for existing certificate
+        download_url = None
+        if existing_certificate.pdf_filename:
+            download_url = await generate_presigned_url(existing_certificate.pdf_filename)
+        
+        return CertificateEligibilityResponse(
+            eligible=True,
+            completed_lessons=0,  # Not needed since they already have a certificate
+            total_lessons=0,
+            progress_percentage=100,
+            message="You already have a certificate for this course",
+            existing_certificate=CertificateResponse(
+                id=existing_certificate.id,
+                user_id=existing_certificate.user_id,
+                course_id=existing_certificate.course_id,
+                issued_at=existing_certificate.issued_at,
+                certificate_hash=existing_certificate.certificate_hash,
+                download_url=download_url
+            )
+        )
+    
+    # Check if user has completed all lessons in the course
+    is_completed, completed_lessons, total_lessons, progress_percentage = check_course_completion(
+        db, current_user.id, course_id
+    )
+    
+    if is_completed:
+        logger.info(f"User {current_user.id} is eligible for a certificate for course {course_id}")
+        return CertificateEligibilityResponse(
+            eligible=True,
+            completed_lessons=completed_lessons,
+            total_lessons=total_lessons,
+            progress_percentage=progress_percentage,
+            message="Congratulations! You've completed all lessons and are eligible for a certificate."
+        )
+    else:
+        logger.info(f"User {current_user.id} is not yet eligible for a certificate for course {course_id}")
+        return CertificateEligibilityResponse(
+            eligible=False,
+            completed_lessons=completed_lessons,
+            total_lessons=total_lessons,
+            progress_percentage=progress_percentage,
+            message=f"Complete all lessons to claim your certificate. You've completed {completed_lessons} of {total_lessons} lessons."
+        )
+
+@app.post("/courses/{course_id}/certificate/claim", response_model=CertificateResponse)
+async def claim_certificate(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Claim a certificate for a completed course"""
+    logger.info(f"Claiming certificate for course {course_id} by user {current_user.id}")
+    
+    # Check if user is enrolled in the course
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id
+    ).first()
+    
+    if not enrollment:
+        logger.error(f"User {current_user.id} not enrolled in course {course_id}")
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Check if user already has a certificate for this course
+    existing_certificate = db.query(CertificateModel).filter(
+        CertificateModel.user_id == current_user.id,
+        CertificateModel.course_id == course_id
+    ).first()
+    
+    if existing_certificate:
+        logger.error(f"User {current_user.id} already has a certificate for course {course_id}")
+        raise HTTPException(status_code=400, detail="You already have a certificate for this course")
+    
+    # Check if user has completed all lessons in the course
+    is_completed, completed_lessons, total_lessons, _ = check_course_completion(
+        db, current_user.id, course_id
+    )
+    
+    if not is_completed:
+        logger.error(f"User {current_user.id} has not completed all lessons in course {course_id}")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"You must complete all lessons to claim a certificate. You've completed {completed_lessons} of {total_lessons} lessons."
+        )
+    
+    # Get course details
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        logger.error(f"Course not found: {course_id}")
+        raise HTTPException(status_code=404, detail="Course not found")
+    
+    # Generate certificate
+    certificate_hash = generate_certificate_hash(current_user.id, course_id)
+    
+    # Create PDF certificate
+    pdf_buffer = create_certificate_pdf(current_user, course, certificate_hash)
+    
+    # Upload certificate to B2
+    pdf_filename = f"certificates/{certificate_hash}.pdf"
+    await upload_certificate_to_b2(pdf_buffer, pdf_filename)
+    
+    # Create certificate record in database
+    certificate = CertificateModel(
+        user_id=current_user.id,
+        course_id=course_id,
+        certificate_hash=certificate_hash,
+        pdf_filename=pdf_filename
+    )
+    
+    db.add(certificate)
+    db.commit()
+    db.refresh(certificate)
+    
+    # Generate download URL
+    download_url = await generate_presigned_url(pdf_filename)
+    
+    logger.info(f"Certificate created for user {current_user.id} for course {course_id}")
+    
+    return CertificateResponse(
+        id=certificate.id,
+        user_id=certificate.user_id,
+        course_id=certificate.course_id,
+        issued_at=certificate.issued_at,
+        certificate_hash=certificate.certificate_hash,
+        download_url=download_url
+    )
+
+@app.get("/certificates", response_model=List[CertificateResponse])
+async def get_user_certificates(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all certificates for the current user"""
+    logger.info(f"Getting certificates for user {current_user.id}")
+    
+    certificates = db.query(CertificateModel).filter(
+        CertificateModel.user_id == current_user.id
+    ).all()
+    
+    # Generate download URLs for each certificate
+    certificate_responses = []
+    for certificate in certificates:
+        download_url = None
+        if certificate.pdf_filename:
+            download_url = await generate_presigned_url(certificate.pdf_filename)
+        
+        certificate_responses.append(CertificateResponse(
+            id=certificate.id,
+            user_id=certificate.user_id,
+            course_id=certificate.course_id,
+            issued_at=certificate.issued_at,
+            certificate_hash=certificate.certificate_hash,
+            download_url=download_url
+        ))
+    
+    return certificate_responses
+
+@app.get("/certificates/{certificate_hash}/verify")
+async def verify_certificate(
+    certificate_hash: str,
+    db: Session = Depends(get_db)
+):
+    """Verify a certificate by its hash"""
+    logger.info(f"Verifying certificate: {certificate_hash}")
+    
+    certificate = db.query(CertificateModel).filter(
+        CertificateModel.certificate_hash == certificate_hash
+    ).first()
+    
+    if not certificate:
+        logger.error(f"Certificate not found: {certificate_hash}")
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    
+    # Get user and course details
+    user = db.query(UserModel).filter(UserModel.id == certificate.user_id).first()
+    course = db.query(CourseModel).filter(CourseModel.id == certificate.course_id).first()
+    
+    if not user or not course:
+        logger.error(f"Associated user or course not found for certificate: {certificate_hash}")
+        raise HTTPException(status_code=404, detail="Certificate details not found")
+    
+    return {
+        "valid": True,
+        "certificate_id": certificate.id,
+        "user_name": user.full_name,
+        "user_email": user.email,
+        "course_title": course.title,
+        "issued_at": certificate.issued_at,
+        "certificate_hash": certificate.certificate_hash
+    }
+
 # All the existing routes from your previous implementation...
 # (Auth routes, course routes, module routes, lesson routes, etc.)
 
@@ -1208,7 +1630,7 @@ async def create_lesson(
     return response_data
 
 # Get lessons for a module
-@app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse])
+@app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse)
 async def get_module_lessons(
     module_id: int,
     current_user: User = Depends(get_current_user),
@@ -1601,7 +2023,7 @@ def delete_module(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    logger.info(f"Deleting module: {module_id} by user: {current_user.email}")
+    logger.info(f"Deleted module: {module_id} by user: {current_user.email}")
     if not current_user.is_instructor:
         logger.error(f"Non-instructor attempt to delete module: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can delete modules")
