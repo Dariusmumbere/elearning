@@ -277,6 +277,7 @@ class QuizResult(BaseModel):
     total: int
     passed: bool
     correct_answers: List[int]
+    attempt_id: int
 
 class QuizAttemptResponse(BaseModel):
     id: int
@@ -793,6 +794,7 @@ async def generate_quiz_for_lesson(
     return {"questions": quiz_questions}
 
 # Replace your current submit_quiz endpoint with this:
+
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
 async def submit_quiz(
     lesson_id: int,
@@ -853,7 +855,8 @@ async def submit_quiz(
         "score": score,
         "total": 5,
         "passed": passed,
-        "correct_answers": correct_answers
+        "correct_answers": correct_answers,
+        "attempt_id": quiz_attempt.id  # ✅ Include attempt ID in response
     }
 
 @app.get("/lessons/{lesson_id}/quiz-attempts", response_model=List[QuizAttemptResponse])
@@ -2034,6 +2037,72 @@ async def download_lesson_pdf(
     except Exception as e:
         logger.error(f"PDF generation error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+# Add this to your backend code (after the existing quiz endpoints)
+
+class QuizQuestionResponse(BaseModel):
+    question: str
+    options: List[str]
+    user_answer: int  # Index of user's selected option
+    correct_answer: int  # Index of correct option
+    is_correct: bool
+
+class QuizAttemptDetailResponse(BaseModel):
+    id: int
+    user_id: int
+    lesson_id: int
+    score: int
+    total: int
+    passed: bool
+    created_at: datetime
+    questions: List[QuizQuestionResponse]
+    
+    class Config:
+        orm_mode = True
+
+@app.get("/quiz-attempts/{attempt_id}", response_model=QuizAttemptDetailResponse)
+async def get_quiz_attempt_details(
+    attempt_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get detailed information about a specific quiz attempt"""
+    logger.info(f"Getting quiz attempt details: {attempt_id} by user: {current_user.email}")
+    
+    # Get the quiz attempt
+    quiz_attempt = db.query(QuizAttemptModel).filter(
+        QuizAttemptModel.id == attempt_id,
+        QuizAttemptModel.user_id == current_user.id
+    ).first()
+    
+    if not quiz_attempt:
+        logger.error(f"Quiz attempt not found: {attempt_id} for user: {current_user.id}")
+        raise HTTPException(status_code=404, detail="Quiz attempt not found")
+    
+    # Build the detailed response
+    questions_with_answers = []
+    for i, question_data in enumerate(quiz_attempt.questions):
+        user_answer = quiz_attempt.user_answers[i] if i < len(quiz_attempt.user_answers) else -1
+        is_correct = user_answer == question_data["correct_answer"]
+        
+        questions_with_answers.append({
+            "question": question_data["question"],
+            "options": question_data["options"],
+            "user_answer": user_answer,
+            "correct_answer": question_data["correct_answer"],
+            "is_correct": is_correct
+        })
+    
+    return {
+        "id": quiz_attempt.id,
+        "user_id": quiz_attempt.user_id,
+        "lesson_id": quiz_attempt.lesson_id,
+        "score": quiz_attempt.score,
+        "total": 5,  # Always 5 questions
+        "passed": quiz_attempt.passed,
+        "created_at": quiz_attempt.created_at,
+        "questions": questions_with_answers
+    }
 # Health check endpoint
 @app.get("/health")
 def health_check():
