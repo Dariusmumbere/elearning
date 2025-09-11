@@ -289,6 +289,46 @@ class QuizAttemptResponse(BaseModel):
     
     class Config:
         orm_mode = True
+def migrate_has_quiz_default(db: Session):
+    """
+    Migration function to ensure all lessons have has_quiz set to True by default.
+    This updates any existing lessons where has_quiz might be NULL or False.
+    """
+    try:
+        logger.info("Starting migration: Setting default has_quiz to True for all lessons")
+        
+        # Count lessons before migration
+        total_lessons = db.query(LessonModel).count()
+        lessons_without_quiz = db.query(LessonModel).filter(
+            (LessonModel.has_quiz == False) | (LessonModel.has_quiz.is_(None))
+        ).count()
+        
+        logger.info(f"Total lessons: {total_lessons}, Lessons without quiz: {lessons_without_quiz}")
+        
+        # Update all lessons to have has_quiz = True
+        db.query(LessonModel).filter(
+            (LessonModel.has_quiz == False) | (LessonModel.has_quiz.is_(None))
+        ).update({LessonModel.has_quiz: True}, synchronize_session=False)
+        
+        db.commit()
+        
+        # Verify the migration
+        lessons_still_without_quiz = db.query(LessonModel).filter(
+            (LessonModel.has_quiz == False) | (LessonModel.has_quiz.is_(None))
+        ).count()
+        
+        logger.info(f"Migration completed. Lessons still without quiz: {lessons_still_without_quiz}")
+        
+        return {
+            "message": "Migration completed successfully",
+            "lessons_updated": lessons_without_quiz,
+            "lessons_still_without_quiz": lessons_still_without_quiz
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Migration failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -1754,13 +1794,20 @@ async def get_video_token(
 
 # Migration endpoint to ensure database schema is up to date
 @app.post("/migrate")
-def run_migrations():
+def run_migrations(db: Session = Depends(get_db)):
     """Run database migrations to ensure schema is up to date"""
     try:
         # Create all tables if they don't exist
         Base.metadata.create_all(bind=engine)
+        
+        # Run the has_quiz migration
+        quiz_migration_result = migrate_has_quiz_default(db)
+        
         logger.info("Database migrations completed successfully")
-        return {"message": "Database schema is up to date"}
+        return {
+            "message": "Database schema is up to date",
+            "quiz_migration": quiz_migration_result
+        }
     except Exception as e:
         logger.error(f"Migration error: {e}")
         raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
@@ -2103,6 +2150,24 @@ async def get_quiz_attempt_details(
         "created_at": quiz_attempt.created_at,
         "questions": questions_with_answers
     }
+
+@app.on_event("startup")
+async def startup_event():
+    """Run migrations on application startup"""
+    logger.info("Running startup migrations...")
+    db = SessionLocal()
+    try:
+        # Create all tables if they don't exist
+        Base.metadata.create_all(bind=engine)
+        
+        # Run the has_quiz migration
+        migrate_has_quiz_default(db)
+        
+        logger.info("Startup migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Startup migration error: {e}")
+    finally:
+        db.close()
 # Health check endpoint
 @app.get("/health")
 def health_check():
