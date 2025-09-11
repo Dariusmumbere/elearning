@@ -1630,7 +1630,7 @@ async def create_lesson(
     return response_data
 
 # Get lessons for a module
-@app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse)
+@app.get("/modules/{module_id}/lessons/", response_model=List[LessonResponse])
 async def get_module_lessons(
     module_id: int,
     current_user: User = Depends(get_current_user),
