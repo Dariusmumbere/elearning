@@ -2590,6 +2590,85 @@ async def startup_event():
         logger.error(f"Startup migration error: {e}")
     finally:
         db.close()
+
+# Add to your existing backend code
+
+@app.get("/api/certificates", response_model=List[CertificateResponse])
+async def get_user_certificates(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all certificates for the current user with course details"""
+    logger.info(f"Getting certificates for user {current_user.id}")
+    
+    certificates = db.query(CertificateModel).filter(
+        CertificateModel.user_id == current_user.id
+    ).all()
+    
+    # Generate download URLs and include course titles
+    certificate_responses = []
+    for certificate in certificates:
+        # Get course details
+        course = db.query(CourseModel).filter(CourseModel.id == certificate.course_id).first()
+        if not course:
+            continue
+            
+        download_url = None
+        if certificate.pdf_filename:
+            download_url = await generate_presigned_url(certificate.pdf_filename)
+        
+        certificate_responses.append({
+            "id": certificate.id,
+            "user_id": certificate.user_id,
+            "course_id": certificate.course_id,
+            "course_title": course.title,
+            "issued_at": certificate.issued_at,
+            "certificate_hash": certificate.certificate_hash,
+            "download_url": download_url
+        })
+    
+    return certificate_responses
+
+@app.get("/api/certificates/{certificate_hash}/download")
+async def download_certificate(
+    certificate_hash: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download a certificate PDF"""
+    logger.info(f"Download request for certificate: {certificate_hash} by user: {current_user.email}")
+    
+    certificate = db.query(CertificateModel).filter(
+        CertificateModel.certificate_hash == certificate_hash,
+        CertificateModel.user_id == current_user.id
+    ).first()
+    
+    if not certificate:
+        logger.error(f"Certificate not found: {certificate_hash} for user: {current_user.id}")
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    
+    if not certificate.pdf_filename:
+        logger.error(f"Certificate PDF not available: {certificate_hash}")
+        raise HTTPException(status_code=404, detail="Certificate file not available")
+    
+    try:
+        # Get the file from B2
+        response = b2_client.get_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=certificate.pdf_filename
+        )
+        
+        # Stream the file directly to the client
+        return StreamingResponse(
+            response['Body'],
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="certificate-{certificate_hash}.pdf"'
+            }
+        )
+    except ClientError as e:
+        logger.error(f"Error downloading certificate from B2: {e}")
+        raise HTTPException(status_code=500, detail="Error downloading certificate")
 # Health check endpoint
 @app.get("/health")
 def health_check():
