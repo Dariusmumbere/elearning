@@ -38,6 +38,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import base64
 from io import BytesIO
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
