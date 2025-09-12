@@ -2593,7 +2593,7 @@ async def startup_event():
 
 # Add to your existing backend code
 
-@app.get("/api/certificates", response_model=List[CertificateResponse])
+@app.get("/certificates", response_model=List[CertificateResponse])
 async def get_user_certificates(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -2629,7 +2629,7 @@ async def get_user_certificates(
     
     return certificate_responses
 
-@app.get("/api/certificates/{certificate_hash}/download")
+@app.get("/certificates/{certificate_hash}/download")
 async def download_certificate(
     certificate_hash: str,
     current_user: User = Depends(get_current_user),
