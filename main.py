@@ -621,80 +621,160 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
         ]
 
 # Certificate Helper Functions
-def generate_certificate_hash(user_id: int, course_id: int) -> str:
-    """Generate a unique hash for the certificate"""
-    unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}"
-    return hashlib.sha256(unique_string.encode()).hexdigest()
-
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
-    """Create a visually appealing certificate PDF"""
+    """Create a visually appealing certificate PDF with professional design"""
     buffer = BytesIO()
     
-    # Create the PDF document
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    # Create the PDF document with A4 size
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                           leftMargin=0.5*inch,
+                           rightMargin=0.5*inch,
+                           topMargin=0.5*inch,
+                           bottomMargin=0.5*inch)
     
     # Container for the 'Flowable' objects
     elements = []
     
     # Add styles
     styles = getSampleStyleSheet()
+    
+    # Register a nice font if available, otherwise use default
+    try:
+        # You might want to add a font file to your project
+        # pdfmetrics.registerFont(TTFont('ElegantFont', 'elegant-font.ttf'))
+        title_font_name = 'Helvetica-Bold'
+        normal_font_name = 'Helvetica'
+    except:
+        title_font_name = 'Helvetica-Bold'
+        normal_font_name = 'Helvetica'
+    
+    # Custom styles
     title_style = ParagraphStyle(
-        'CustomTitle',
+        'CertificateTitle',
         parent=styles['Title'],
+        fontName=title_font_name,
         fontSize=36,
         spaceAfter=30,
         alignment=TA_CENTER,
-        textColor=colors.HexColor('#2C3E50')
+        textColor=colors.HexColor('#2C3E50'),
+        leading=42
     )
     
     subtitle_style = ParagraphStyle(
-        'CustomSubtitle',
+        'CertificateSubtitle',
         parent=styles['Heading2'],
+        fontName=title_font_name,
         fontSize=24,
         spaceAfter=20,
         alignment=TA_CENTER,
-        textColor=colors.HexColor('#34495E')
+        textColor=colors.HexColor('#34495E'),
+        leading=30
     )
     
     normal_style = ParagraphStyle(
-        'CustomNormal',
+        'CertificateNormal',
         parent=styles['Normal'],
+        fontName=normal_font_name,
         fontSize=16,
         spaceAfter=12,
         alignment=TA_CENTER,
-        textColor=colors.HexColor('#7F8C8D')
+        textColor=colors.HexColor('#7F8C8D'),
+        leading=20
     )
     
     name_style = ParagraphStyle(
-        'CustomName',
+        'CertificateName',
         parent=styles['Heading1'],
+        fontName=title_font_name,
         fontSize=42,
         spaceAfter=30,
         alignment=TA_CENTER,
-        textColor=colors.HexColor('#2980B9')
+        textColor=colors.HexColor('#2980B9'),
+        leading=50
     )
     
-    # Add certificate content
-    elements.append(Spacer(1, 50))
+    small_style = ParagraphStyle(
+        'CertificateSmall',
+        parent=styles['Normal'],
+        fontName=normal_font_name,
+        fontSize=10,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#BDC3C7'),
+        leading=12
+    )
+    
+    # Add decorative border
+    border_width = 0.5
+    border_color = colors.HexColor('#E67E22')
+    border_style = TableStyle([
+        ('LINEABOVE', (0, 0), (-1, -1), border_width, border_color),
+        ('LINEBELOW', (0, 0), (-1, -1), border_width, border_color),
+        ('LINEBEFORE', (0, 0), (-1, -1), border_width, border_color),
+        ('LINEAFTER', (0, 0), (-1, -1), border_width, border_color),
+        ('BOX', (0, 0), (-1, -1), border_width, border_color),
+    ])
+    
+    # Download and add eLearning logo
+    try:
+        logo_url = "https://github.com/Dariusmumbere/elearning/logo.PNG"
+        response = requests.get(logo_url)
+        if response.status_code == 200:
+            logo_img = Image(BytesIO(response.content))
+            logo_img.drawHeight = 1.5 * inch * logo_img.drawHeight / logo_img.drawWidth
+            logo_img.drawWidth = 1.5 * inch
+            logo_img.hAlign = 'CENTER'
+            elements.append(logo_img)
+            elements.append(Spacer(1, 20))
+    except Exception as e:
+        logger.warning(f"Could not load logo: {e}")
+        # Add a text placeholder if logo fails to load
+        elements.append(Paragraph("eLearning Platform", title_style))
+    
+    elements.append(Spacer(1, 20))
+    
+    # Add decorative element
+    decorative_line = Table([['']], colWidths=[6*inch], rowHeights=[2])
+    decorative_line.setStyle(TableStyle([
+        ('LINEABOVE', (0, 0), (-1, -1), 1, colors.HexColor('#3498DB')),
+        ('LINEBELOW', (0, 0), (-1, -1), 1, colors.HexColor('#3498DB')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+    ]))
+    elements.append(decorative_line)
+    elements.append(Spacer(1, 30))
     
     # Certificate title
-    elements.append(Paragraph("CERTIFICATE OF COMPLETION", title_style))
+    elements.append(Paragraph("CERTIFICATE OF ACHIEVEMENT", title_style))
     elements.append(Spacer(1, 20))
     
     # This certifies that
     elements.append(Paragraph("This is to certify that", normal_style))
     elements.append(Spacer(1, 10))
     
-    # Student name
-    elements.append(Paragraph(user.full_name.upper(), name_style))
+    # Student name with special styling
+    name_border = Table([[Paragraph(user.full_name.upper(), name_style)]], 
+                       colWidths=[6*inch], 
+                       rowHeights=[0.8*inch])
+    name_border.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#E67E22')),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FDF2E9')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(name_border)
     elements.append(Spacer(1, 20))
     
     # Completion text
     elements.append(Paragraph("has successfully completed the course", normal_style))
     elements.append(Spacer(1, 20))
     
-    # Course title
-    elements.append(Paragraph(f'"{course.title}"', subtitle_style))
+    # Course title with special styling
+    course_table = Table([[Paragraph(f'"{course.title}"', subtitle_style)]], 
+                        colWidths=[6*inch])
+    course_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(course_table)
     elements.append(Spacer(1, 30))
     
     # Date of completion
@@ -702,10 +782,10 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     elements.append(Paragraph(f"Awarded on {completion_date}", normal_style))
     elements.append(Spacer(1, 40))
     
-    # Signature area
+    # Signature area with decorative lines
     signature_data = [
-        ["_________________________", "_________________________"],
-        ["Course Instructor", "Platform Director"]
+        [Paragraph("_________________________", normal_style), Paragraph("_________________________", normal_style)],
+        [Paragraph("Course Instructor", small_style), Paragraph("Platform Director", small_style)]
     ]
     
     signature_table = Table(signature_data, colWidths=[3*inch, 3*inch])
@@ -713,21 +793,36 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('FONTSIZE', (0, 0), (-1, -1), 12),
         ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#7F8C8D')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
     ]))
     
     elements.append(signature_table)
     elements.append(Spacer(1, 30))
     
-    # Certificate ID
-    elements.append(Paragraph(f"Certificate ID: {certificate_hash}", 
-                             ParagraphStyle('CustomSmall', 
-                                           parent=styles['Normal'], 
-                                           fontSize=10, 
-                                           alignment=TA_CENTER,
-                                           textColor=colors.HexColor('#BDC3C7'))))
+    # Certificate ID with decorative background
+    cert_id_table = Table([[Paragraph(f"Certificate ID: {certificate_hash}", small_style)]],
+                         colWidths=[6*inch],
+                         rowHeights=[0.4*inch])
+    cert_id_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F8F9F9')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#EBEDEF')),
+    ]))
     
-    # Build PDF
-    doc.build(elements)
+    elements.append(cert_id_table)
+    elements.append(Spacer(1, 20))
+    
+    # Add a decorative footer
+    footer = Paragraph("This certificate is issued by eLearning Platform and verifiable online", small_style)
+    elements.append(footer)
+    
+    # Build PDF with border
+    content_table = Table([[elements]], colWidths=[7*inch])
+    content_table.setStyle(border_style)
+    
+    final_content = [content_table]
+    doc.build(final_content)
     
     # Reset buffer position
     buffer.seek(0)
