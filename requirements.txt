@@ -15,4 +15,3 @@ google-generativeai
 alembic
 pdfkit
 reportlab
-hashlib
