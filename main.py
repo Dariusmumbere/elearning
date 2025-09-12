@@ -693,7 +693,7 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     )
     
     # Add decorative border
-    border_width = 0.5
+    border_width = 2
     border_color = colors.HexColor('#E67E22')
     
     # Create a table for the border
@@ -711,7 +711,7 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     
     # Add eLearning logo (try to download from URL)
     try:
-        logo_url = "https://github.com/Dariusmumbere/elearning/logo.PNG"
+        logo_url = "https://raw.githubusercontent.com/Dariusmumbere/elearning/main/logo.png"
         response = requests.get(logo_url)
         if response.status_code == 200:
             logo_img = Image(BytesIO(response.content))
@@ -781,7 +781,7 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     # Signature area with decorative lines
     signature_data = [
         ["_________________________", "_________________________"],
-        ["Instructor", "Director"]
+        ["Course Instructor", "Platform Director"]
     ]
     
     signature_table = Table(signature_data, colWidths=[3*inch, 3*inch])
@@ -806,42 +806,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     elements.append(cert_id_bg)
-    
-    # Add decorative corner elements
-    corner_size = 0.3*inch
-    corner_color = colors.HexColor('#E67E22')
-    
-    # Top-left corner
-    tl_corner = Table([['']], colWidths=[corner_size], rowHeights=[corner_size])
-    tl_corner.setStyle(TableStyle([
-        ('LINEBELOW', (0, 0), (-1, -1), 3, corner_color),
-        ('LINEAFTER', (0, 0), (-1, -1), 3, corner_color),
-    ]))
-    
-    # Top-right corner
-    tr_corner = Table([['']], colWidths=[corner_size], rowHeights=[corner_size])
-    tr_corner.setStyle(TableStyle([
-        ('LINEBELOW', (0, 0), (-1, -1), 3, corner_color),
-        ('LINEBEFORE', (0, 0), (-1, -1), 3, corner_color),
-    ]))
-    
-    # Bottom-left corner
-    bl_corner = Table([['']], colWidths=[corner_size], rowHeights=[corner_size])
-    bl_corner.setStyle(TableStyle([
-        ('LINEABOVE', (0, 0), (-1, -1), 3, corner_color),
-        ('LINEAFTER', (0, 0), (-1, -1), 3, corner_color),
-    ]))
-    
-    # Bottom-right corner
-    br_corner = Table([['']], colWidths=[corner_size], rowHeights=[corner_size])
-    br_corner.setStyle(TableStyle([
-        ('LINEABOVE', (0, 0), (-1, -1), 3, corner_color),
-        ('LINEBEFORE', (0, 0), (-1, -1), 3, corner_color),
-    ]))
-    
-    # Position corners using frames (this is a simplified approach)
-    # In a real implementation, you might need to use a different approach
-    # to position elements at the corners of the page
     
     # Build PDF
     doc.build(elements)
