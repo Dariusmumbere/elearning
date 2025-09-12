@@ -619,7 +619,11 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             }
             for i in range(5)
         ]
-
+def generate_certificate_hash(user_id: int, course_id: int) -> str:
+    """Generate a unique hash for the certificate"""
+    unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}_{uuid.uuid4()}"
+    return hashlib.sha256(unique_string.encode()).hexdigest()[:16]  # Using first 16 chars for readability
+    
 # Certificate Helper Functions
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
     """Create a visually appealing certificate PDF with professional design"""
