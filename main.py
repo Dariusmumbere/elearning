@@ -2742,6 +2742,36 @@ async def download_certificate(
     except ClientError as e:
         logger.error(f"Error downloading certificate from B2: {e}")
         raise HTTPException(status_code=500, detail="Error downloading certificate")
+
+@app.get("/b2-proxy/{filename:path}")
+async def b2_proxy(filename: str, db: Session = Depends(get_db)):
+    """
+    Proxy endpoint to serve private B2 files without exposing presigned URLs
+    """
+    try:
+        # Verify the file exists and user has access (optional)
+        # For course images, you might want to check if user can access the course
+        
+        # Generate presigned URL
+        presigned_url = await generate_presigned_url(filename)
+        
+        # Proxy the request
+        response = requests.get(presigned_url, stream=True)
+        
+        if response.status_code == 200:
+            return StreamingResponse(
+                response.iter_content(chunk_size=8192),
+                media_type=response.headers.get('content-type', 'application/octet-stream'),
+                headers={
+                    'Content-Disposition': response.headers.get('content-disposition', 'inline')
+                }
+            )
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error accessing file: {str(e)}")
+        
 # Health check endpoint
 @app.get("/health")
 def health_check():
