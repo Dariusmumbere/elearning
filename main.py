@@ -225,7 +225,7 @@ class Course(CourseBase):
     id: int
     instructor_id: int
     created_at: datetime
-    instructor_name: str  
+    instructor_name: Optional[str] = None  # Make this optional
     is_published: bool
     image_url: Optional[str] = None
     
@@ -1469,6 +1469,8 @@ async def create_course(
     db: Session = Depends(get_db)
 ):
     logger.info(f"Creating course: {title} by user: {current_user.email}")
+    
+    # Only instructors can create courses
     if not current_user.is_instructor:
         logger.error(f"Non-instructor attempt to create course: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can create courses")
@@ -1489,6 +1491,7 @@ async def create_course(
         image_filename = await upload_to_b2(image_file, "courses")
         logger.info(f"Course image uploaded: {image_filename}")
     
+    # Create the course in the database
     db_course = CourseModel(
         title=title,
         description=description,
@@ -1504,16 +1507,17 @@ async def create_course(
     if image_filename:
         image_url = await generate_presigned_url(image_filename)
     
-    # Return course with image URL
-    course_data = {
-        "id": db_course.id,
-        "title": db_course.title,
-        "description": db_course.description,
-        "instructor_id": db_course.instructor_id,
-        "created_at": db_course.created_at,
-        "is_published": db_course.is_published,
-        "image_url": image_url
-    }
+    # Return a proper Course object including instructor_name
+    return Course(
+        id=db_course.id,
+        title=db_course.title,
+        description=db_course.description,
+        instructor_id=db_course.instructor_id,
+        instructor_name=current_user.full_name,  # Add current user's full name
+        created_at=db_course.created_at,
+        is_published=db_course.is_published,
+        image_url=image_url
+    )
     
     logger.info(f"Course created successfully: {db_course.id}")
     return course_data
@@ -1523,7 +1527,6 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
     logger.info(f"Fetching courses, skip: {skip}, limit: {limit}")
     courses = db.query(CourseModel).filter(CourseModel.is_published == True).offset(skip).limit(limit).all()
     
-    # Convert ORM objects to dicts and generate presigned URLs for images
     course_list = []
     for course in courses:
         image_url = None
@@ -1534,21 +1537,22 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
         instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
         instructor_name = instructor.full_name if instructor else "Unknown Instructor"
         
-        course_dict = {
-            "id": course.id,
-            "title": course.title,
-            "description": course.description,
-            "instructor_id": course.instructor_id,
-            "instructor_name": instructor_name,  # Add this
-            "created_at": course.created_at,
-            "is_published": course.is_published,
-            "image_url": image_url
-        }
-        course_list.append(course_dict)
+        # Create a proper Course response object
+        course_data = Course(
+            id=course.id,
+            title=course.title,
+            description=course.description,
+            instructor_id=course.instructor_id,
+            instructor_name=instructor_name,
+            created_at=course.created_at,
+            is_published=course.is_published,
+            image_url=image_url
+        )
+        course_list.append(course_data)
     
     logger.info(f"Returning {len(course_list)} courses")
     return course_list
-
+    
 @app.get("/courses/{course_id}", response_model=Course)
 async def read_course(course_id: int, db: Session = Depends(get_db)):
     logger.info(f"Fetching course: {course_id}")
@@ -1566,17 +1570,17 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
     instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
     instructor_name = instructor.full_name if instructor else "Unknown Instructor"
     
-    # Return the course with the correct image URL
-    course_data = {
-        "id": course.id,
-        "title": course.title,
-        "description": course.description,
-        "instructor_id": course.instructor_id,
-        "instructor_name": instructor_name,  # Add this
-        "created_at": course.created_at,
-        "is_published": course.is_published,
-        "image_url": image_url
-    }
+    # Return a proper Course response object
+    return Course(
+        id=course.id,
+        title=course.title,
+        description=course.description,
+        instructor_id=course.instructor_id,
+        instructor_name=instructor_name,
+        created_at=course.created_at,
+        is_published=course.is_published,
+        image_url=image_url
+    )
     
     logger.info(f"Course found: {course_id}")
     return course_data
