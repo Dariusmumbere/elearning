@@ -225,7 +225,7 @@ class Course(CourseBase):
     id: int
     instructor_id: int
     created_at: datetime
-     instructor_name: str  
+    instructor_name: str  
     is_published: bool
     image_url: Optional[str] = None
     
