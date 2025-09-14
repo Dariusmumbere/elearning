@@ -225,6 +225,7 @@ class Course(CourseBase):
     id: int
     instructor_id: int
     created_at: datetime
+     instructor_name: str  
     is_published: bool
     image_url: Optional[str] = None
     
@@ -1529,11 +1530,16 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
         if course.image_filename:
             image_url = await generate_presigned_url(course.image_filename)
         
+        # Get instructor name
+        instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
+        instructor_name = instructor.full_name if instructor else "Unknown Instructor"
+        
         course_dict = {
             "id": course.id,
             "title": course.title,
             "description": course.description,
             "instructor_id": course.instructor_id,
+            "instructor_name": instructor_name,  # Add this
             "created_at": course.created_at,
             "is_published": course.is_published,
             "image_url": image_url
@@ -1556,12 +1562,17 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
     if course.image_filename:
         image_url = await generate_presigned_url(course.image_filename)
     
+    # Get instructor name
+    instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
+    instructor_name = instructor.full_name if instructor else "Unknown Instructor"
+    
     # Return the course with the correct image URL
     course_data = {
         "id": course.id,
         "title": course.title,
         "description": course.description,
         "instructor_id": course.instructor_id,
+        "instructor_name": instructor_name,  # Add this
         "created_at": course.created_at,
         "is_published": course.is_published,
         "image_url": image_url
