@@ -408,7 +408,10 @@ def get_db():
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
+    # Simple truncation to avoid bcrypt limitation
+    if len(password) > 70:
+        password = password[:70]
     return pwd_context.hash(password)
 
 def get_user_by_email(db: Session, email: str):
