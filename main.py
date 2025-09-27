@@ -66,7 +66,7 @@ b2_client = boto3.client(
 )
 
 # Database configuration (using your credentials)
-DATABASE_URL = "postgresql://blog_0bcu_user:RXAJHCfB4v6iU9gaNBHrA06QmCzZxLFK@dpg-d2nbbmq4d50c73e5ovug-a/blog_0bcu"
+DATABASE_URL = "postgresql://coderise_user:904Eas2xW68KrdG9ASJGqPBTZion1zsg@dpg-d3c2n96mcj7s73d7c5q0-a/coderise"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
