@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
 from typing import Optional, List, Union
 from jose import JWTError, jwt
@@ -197,6 +197,14 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str
     is_instructor: bool = False
+    
+    @validator('password')
+    def validate_password_length(cls, v):
+        if len(v.encode('utf-8')) > 100:  # Reasonable limit with buffer
+            raise ValueError('Password must be less than 100 characters')
+        if len(v) < 6:
+            raise ValueError('Password must be at least 6 characters')
+        return v
 
 class User(UserBase):
     id: int
@@ -383,7 +391,13 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 VIDEO_TOKEN_EXPIRE_MINUTES = 60  # Shorter lifespan for video tokens
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Enhanced password context with fallback support
+pwd_context = CryptContext(
+    schemes=["bcrypt", "argon2"],  # Try bcrypt first, fallback to argon2
+    deprecated="auto",
+    bcrypt__rounds=12  # Reasonable number of rounds
+)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="eLearning Platform API")
@@ -406,13 +420,77 @@ def get_db():
         db.close()
 
 def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify password with robust error handling"""
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
+
+def safe_bcrypt_hash(password: str) -> str:
+    """Safe wrapper for bcrypt password hashing with length handling"""
+    try:
+        # Convert to bytes and check length
+        password_bytes = password.encode('utf-8')
+        
+        # Truncate to 72 bytes if necessary (bcrypt limitation)
+        if len(password_bytes) > 72:
+            # Try to decode back to string at valid UTF-8 boundary
+            truncated_bytes = password_bytes[:72]
+            # Find the last valid UTF-8 character boundary
+            for i in range(72, 0, -1):
+                try:
+                    truncated_bytes = password_bytes[:i]
+                    truncated_password = truncated_bytes.decode('utf-8')
+                    logger.warning(f"Password truncated from {len(password_bytes)} to {len(truncated_bytes)} bytes for bcrypt compatibility")
+                    password = truncated_password
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                # If all else fails, use replacement strategy
+                password = password_bytes[:72].decode('utf-8', errors='replace')
+        
+        return pwd_context.hash(password)
+    
+    except ValueError as e:
+        if "password cannot be longer than 72 bytes" in str(e):
+            # Retry with more aggressive truncation
+            password_bytes = password.encode('utf-8')[:70]  # Extra buffer
+            password = password_bytes.decode('utf-8', errors='replace')
+            return pwd_context.hash(password)
+        logger.error(f"Bcrypt hashing error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected hashing error: {e}")
+        raise
 
 def get_password_hash(password: str) -> str:
-    # Simple truncation to avoid bcrypt limitation
-    if len(password) > 70:
-        password = password[:70]
-    return pwd_context.hash(password)
+    """Get password hash with robust error handling and fallback"""
+    try:
+        # Validate input
+        if not password or not isinstance(password, str):
+            raise ValueError("Invalid password format")
+        
+        # Try bcrypt first with safe handling
+        return safe_bcrypt_hash(password)
+        
+    except Exception as e:
+        logger.error(f"Primary hashing failed: {e}")
+        
+        # Fallback: Use a different scheme or simple truncation
+        try:
+            logger.warning("Falling back to simplified hashing")
+            # Simple truncation and hash
+            if len(password) > 70:
+                password = password[:70]
+            return pwd_context.hash(password)
+        except Exception as fallback_error:
+            logger.critical(f"All hashing methods failed: {fallback_error}")
+            raise HTTPException(
+                status_code=500,
+                detail="System error: Unable to process password"
+            )
 
 def get_user_by_email(db: Session, email: str):
     return db.query(UserModel).filter(UserModel.email == email).first()
@@ -545,7 +623,6 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
 # Quiz Helper Functions
-# Replace your current generate_quiz function with this:
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
     """Generate a quiz using Gemini AI based on lesson content"""
     try:
@@ -623,6 +700,7 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             }
             for i in range(5)
         ]
+
 def generate_certificate_hash(user_id: int, course_id: int) -> str:
     """Generate a unique hash for the certificate"""
     unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}_{uuid.uuid4()}"
@@ -1062,7 +1140,6 @@ async def get_video_token(
     }
 
 # NEW: Quiz Endpoints
-# Replace your current generate_quiz_for_lesson endpoint with this:
 @app.post("/lessons/{lesson_id}/generate-quiz", response_model=QuizResponse)
 async def generate_quiz_for_lesson(
     lesson_id: int,
@@ -1096,8 +1173,6 @@ async def generate_quiz_for_lesson(
     quiz_questions = await generate_quiz(lesson.content)
     
     return {"questions": quiz_questions}
-
-# Replace your current submit_quiz endpoint with this:
 
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
 async def submit_quiz(
@@ -1160,7 +1235,7 @@ async def submit_quiz(
         "total": 5,
         "passed": passed,
         "correct_answers": correct_answers,
-        "attempt_id": quiz_attempt.id  # ✅ Include attempt ID in response
+        "attempt_id": quiz_attempt.id
     }
 
 @app.get("/lessons/{lesson_id}/quiz-attempts", response_model=List[QuizAttemptResponse])
@@ -1230,7 +1305,7 @@ async def check_certificate_eligibility(
         
         return CertificateEligibilityResponse(
             eligible=True,
-            completed_lessons=0,  # Not needed since they already have a certificate
+            completed_lessons=0,
             total_lessons=0,
             progress_percentage=100,
             message="You already have a certificate for this course",
@@ -1415,9 +1490,6 @@ async def verify_certificate(
         "certificate_hash": certificate.certificate_hash
     }
 
-# All the existing routes from your previous implementation...
-# (Auth routes, course routes, module routes, lesson routes, etc.)
-
 # Auth routes
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -1440,22 +1512,43 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 @app.post("/users/", response_model=User)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
     logger.info(f"Creating new user: {user.email}")
+    
+    # Validate password length before processing
+    password_bytes = user.password.encode('utf-8')
+    if len(password_bytes) > 100:
+        raise HTTPException(
+            status_code=400, 
+            detail="Password is too long. Please use a password with less than 100 characters."
+        )
+    
     db_user = get_user_by_email(db, email=user.email)
     if db_user:
         logger.error(f"User already exists: {user.email}")
         raise HTTPException(status_code=400, detail="Email already registered")
-    hashed_password = get_password_hash(user.password)
-    db_user = UserModel(
-        email=user.email, 
-        hashed_password=hashed_password, 
-        full_name=user.full_name,
-        is_instructor=user.is_instructor
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    logger.info(f"User created successfully: {user.email}")
-    return db_user
+    
+    try:
+        hashed_password = get_password_hash(user.password)
+        db_user = UserModel(
+            email=user.email, 
+            hashed_password=hashed_password, 
+            full_name=user.full_name,
+            is_instructor=user.is_instructor
+        )
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        logger.info(f"User created successfully: {user.email}")
+        return db_user
+    
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating user: {e}")
+        if "Password must be" in str(e):
+            raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=500, 
+            detail="Error creating user account. Please try again."
+        )
 
 @app.get("/users/me/", response_model=User)
 async def read_users_me(current_user: User = Depends(get_current_user)):
@@ -1516,14 +1609,11 @@ async def create_course(
         title=db_course.title,
         description=db_course.description,
         instructor_id=db_course.instructor_id,
-        instructor_name=current_user.full_name,  # Add current user's full name
+        instructor_name=current_user.full_name,
         created_at=db_course.created_at,
         is_published=db_course.is_published,
         image_url=image_url
     )
-    
-    logger.info(f"Course created successfully: {db_course.id}")
-    return course_data
 
 @app.get("/courses/", response_model=List[Course])
 async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
@@ -1584,9 +1674,6 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
         is_published=course.is_published,
         image_url=image_url
     )
-    
-    logger.info(f"Course found: {course_id}")
-    return course_data
 
 # Module routes
 @app.post("/courses/{course_id}/modules/", response_model=Module)
@@ -2583,8 +2670,6 @@ async def download_lesson_pdf(
         logger.error(f"PDF generation error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
 
-# Add this to your backend code (after the existing quiz endpoints)
-
 class QuizQuestionResponse(BaseModel):
     question: str
     options: List[str]
@@ -2666,8 +2751,6 @@ async def startup_event():
         logger.error(f"Startup migration error: {e}")
     finally:
         db.close()
-
-# Add to your existing backend code
 
 @app.get("/certificates", response_model=List[CertificateResponse])
 async def get_user_certificates(
