@@ -66,7 +66,7 @@ b2_client = boto3.client(
 )
 
 # Database configuration (using your credentials)
-DATABASE_URL = "postgresql://coderise_user:904Eas2xW68KrdG9ASJGqPBTZion1zsg@dpg-d3c2n96mcj7s73d7c5q0-a/coderise"
+DATABASE_URL = "postgresql://elearning_db_8tk6_user:4VmNjov8BnOZchfjpJdWCmbjyXJ0iAoq@dpg-d4hc7uemcj7s73bu9rh0-a/elearning_db_8tk6"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
