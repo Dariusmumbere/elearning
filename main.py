@@ -389,10 +389,13 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="eLearning Platform API")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://yourdomain.com"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://online-yze5-myir9uasl-dariusmumberes-projects.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
