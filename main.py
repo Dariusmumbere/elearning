@@ -546,7 +546,6 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
 # Quiz Helper Functions
-# Replace your current generate_quiz function with this:
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
     """Generate a quiz using Gemini AI based on lesson content"""
     try:
@@ -569,6 +568,8 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
         
         Lesson Content:
         {lesson_content}
+        
+        Return ONLY valid JSON. Do not include any additional text.
         """
         
         response = model.generate_content(prompt)
@@ -576,54 +577,84 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
         # Extract JSON from response
         try:
             # Try to find JSON in the response
-            json_str = response.text
-            if "```json" in json_str:
-                json_str = json_str.split("```json")[1].split("```")[0]
-            elif "```" in json_str:
-                json_str = json_str.split("```")[1].split("```")[0]
+            json_str = response.text.strip()
+            
+            # Remove any markdown formatting
+            if json_str.startswith("```json"):
+                json_str = json_str[7:]
+            if json_str.endswith("```"):
+                json_str = json_str[:-3]
+            if json_str.startswith("```"):
+                json_str = json_str[3:]
+            json_str = json_str.strip()
             
             quiz_data = json.loads(json_str)
             
             # Validate the structure
             if "questions" in quiz_data and len(quiz_data["questions"]) == 5:
                 # Validate each question has the correct structure
+                validated_questions = []
                 for i, question in enumerate(quiz_data["questions"]):
                     if not all(key in question for key in ["question", "options", "correct_answer"]):
+                        logger.warning(f"Question {i+1} missing required fields, using fallback")
                         raise ValueError(f"Question {i+1} missing required fields")
+                    
                     if len(question["options"]) != 4:
+                        logger.warning(f"Question {i+1} doesn't have exactly 4 options, using fallback")
                         raise ValueError(f"Question {i+1} doesn't have exactly 4 options")
+                    
+                    if not isinstance(question["correct_answer"], int):
+                        logger.warning(f"Question {i+1} correct_answer is not integer, using fallback")
+                        raise ValueError(f"Question {i+1} correct_answer is not integer")
+                    
                     if not 0 <= question["correct_answer"] <= 3:
+                        logger.warning(f"Question {i+1} has invalid correct_answer index, using fallback")
                         raise ValueError(f"Question {i+1} has invalid correct_answer index")
+                    
+                    # Ensure options are strings
+                    question["options"] = [str(opt) for opt in question["options"]]
+                    validated_questions.append(question)
                 
-                return quiz_data["questions"]
+                return validated_questions
             else:
                 raise ValueError("Invalid quiz format from AI")
                 
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.error(f"Failed to parse AI response: {e}")
             logger.error(f"AI response: {response.text}")
             
-            # Fallback: create a simple quiz
-            return [
-                {
-                    "question": "What was the main topic of this lesson?",
-                    "options": ["Option A", "Option B", "Option C", "Option D"],
-                    "correct_answer": 0
-                }
-                for _ in range(5)
-            ]
+            # Fallback: create a simple quiz based on lesson content
+            return create_fallback_quiz(lesson_content)
             
     except Exception as e:
         logger.error(f"Error generating quiz: {e}")
         # Fallback quiz
-        return [
-            {
-                "question": f"Question {i+1} about the lesson content",
-                "options": ["Option A", "Option B", "Option C", "Option D"],
-                "correct_answer": 0
-            }
-            for i in range(5)
-        ]
+        return create_fallback_quiz("")
+
+def create_fallback_quiz(lesson_content: str) -> List[dict]:
+    """Create a fallback quiz when AI generation fails"""
+    # Try to extract key concepts from lesson content for fallback
+    key_concepts = []
+    if lesson_content:
+        # Simple extraction of potential key concepts (first few sentences)
+        sentences = lesson_content.split('.')[:3]
+        key_concepts = [s.strip() for s in sentences if s.strip()]
+    
+    questions = []
+    for i in range(5):
+        if key_concepts and i < len(key_concepts):
+            question_text = f"What is the main idea about: {key_concepts[i]}"
+        else:
+            question_text = f"Question {i+1} about the lesson content"
+        
+        questions.append({
+            "question": question_text,
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correct_answer": 0
+        })
+    
+    return questions
+
 def generate_certificate_hash(user_id: int, course_id: int) -> str:
     """Generate a unique hash for the certificate"""
     unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}_{uuid.uuid4()}"
@@ -816,7 +847,7 @@ def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
     # Get all lessons in the course
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
-        return False, 0, 0
+        return False, 0, 0, 0
     
     total_lessons = 0
     completed_lessons = 0
@@ -1063,13 +1094,13 @@ async def get_video_token(
     }
 
 # NEW: Quiz Endpoints
-# Replace your current generate_quiz_for_lesson endpoint with this:
 @app.post("/lessons/{lesson_id}/generate-quiz", response_model=QuizResponse)
 async def generate_quiz_for_lesson(
     lesson_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Generate a quiz for a specific lesson"""
     logger.info(f"Generating quiz for lesson {lesson_id} by user {current_user.id}")
     
     # Verify user has access to this lesson and get lesson content
@@ -1098,8 +1129,6 @@ async def generate_quiz_for_lesson(
     
     return {"questions": quiz_questions}
 
-# Replace your current submit_quiz endpoint with this:
-
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
 async def submit_quiz(
     lesson_id: int,
@@ -1107,7 +1136,9 @@ async def submit_quiz(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Submit quiz answers and get results"""
     logger.info(f"Submitting quiz for lesson {lesson_id} by user {current_user.id}")
+    logger.info(f"User answers: {submission.answers}")
     
     # Verify user has access to this lesson and get lesson content
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
@@ -1128,14 +1159,34 @@ async def submit_quiz(
     # Generate the same quiz again to get correct answers using the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
+    # Validate user answers length
+    if len(submission.answers) != 5:
+        logger.error(f"Invalid number of answers: {len(submission.answers)}. Expected 5.")
+        raise HTTPException(status_code=400, detail="You must answer all 5 questions")
+    
+    # Validate each answer is within range
+    for i, answer in enumerate(submission.answers):
+        if not isinstance(answer, int) or answer < 0 or answer > 3:
+            logger.error(f"Invalid answer at position {i}: {answer}")
+            raise HTTPException(status_code=400, detail=f"Answer {i+1} must be between 0 and 3")
+    
     # Calculate score
     score = 0
     correct_answers = []
     
     for i, question in enumerate(quiz_questions):
-        correct_answers.append(question["correct_answer"])
-        if i < len(submission.answers) and submission.answers[i] == question["correct_answer"]:
-            score += 1
+        correct_answer = question["correct_answer"]
+        correct_answers.append(correct_answer)
+        
+        if i < len(submission.answers):
+            user_answer = submission.answers[i]
+            logger.info(f"Question {i+1}: User answered {user_answer}, Correct answer is {correct_answer}")
+            
+            if user_answer == correct_answer:
+                score += 1
+                logger.info(f"Question {i+1}: CORRECT")
+            else:
+                logger.info(f"Question {i+1}: WRONG")
     
     # Check if passed (at least 3 correct answers)
     passed = score >= 3
@@ -1161,7 +1212,7 @@ async def submit_quiz(
         "total": 5,
         "passed": passed,
         "correct_answers": correct_answers,
-        "attempt_id": quiz_attempt.id  # ✅ Include attempt ID in response
+        "attempt_id": quiz_attempt.id
     }
 
 @app.get("/lessons/{lesson_id}/quiz-attempts", response_model=List[QuizAttemptResponse])
@@ -1170,6 +1221,7 @@ async def get_quiz_attempts(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Get all quiz attempts for a specific lesson"""
     logger.info(f"Getting quiz attempts for lesson {lesson_id} by user {current_user.id}")
     
     # Verify user has access to this lesson
@@ -1517,14 +1569,11 @@ async def create_course(
         title=db_course.title,
         description=db_course.description,
         instructor_id=db_course.instructor_id,
-        instructor_name=current_user.full_name,  # Add current user's full name
+        instructor_name=current_user.full_name,
         created_at=db_course.created_at,
         is_published=db_course.is_published,
         image_url=image_url
     )
-    
-    logger.info(f"Course created successfully: {db_course.id}")
-    return course_data
 
 @app.get("/courses/", response_model=List[Course])
 async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
@@ -1585,9 +1634,6 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
         is_published=course.is_published,
         image_url=image_url
     )
-    
-    logger.info(f"Course found: {course_id}")
-    return course_data
 
 # Module routes
 @app.post("/courses/{course_id}/modules/", response_model=Module)
