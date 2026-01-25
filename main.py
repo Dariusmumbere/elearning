@@ -39,6 +39,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import base64
 from io import BytesIO
 import hashlib
+import asyncio
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -288,9 +289,11 @@ class QuizRequest(BaseModel):
 
 class QuizResponse(BaseModel):
     questions: List[QuizQuestion]
+    quiz_id: str  # Add a unique ID for each generated quiz
 
 class QuizSubmission(BaseModel):
     answers: List[int]  # List of selected option indices
+    quiz_id: Optional[str] = None  # Include the quiz ID to match questions
 
 class QuizResult(BaseModel):
     score: int
@@ -330,6 +333,9 @@ class CertificateEligibilityResponse(BaseModel):
     progress_percentage: float
     message: Optional[str] = None
     existing_certificate: Optional[CertificateResponse] = None
+
+# Quiz storage for session (temporary - in production use Redis or similar)
+quiz_storage = {}
 
 def migrate_has_quiz_default(db: Session):
     """
@@ -542,7 +548,7 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
 
-# Quiz Helper Functions
+# Quiz Helper Functions - UPDATED TO STORE AND RETRIEVE QUIZZES
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
     """Generate a quiz using Gemini AI based on lesson content"""
     try:
@@ -1100,14 +1106,14 @@ async def get_video_token(
         "expires_at": datetime.utcnow() + expires_delta
     }
 
-# NEW: Quiz Endpoints
+# NEW: Quiz Endpoints - FIXED VERSION
 @app.post("/lessons/{lesson_id}/generate-quiz", response_model=QuizResponse)
 async def generate_quiz_for_lesson(
     lesson_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Generate a quiz for a specific lesson"""
+    """Generate a quiz for a specific lesson and store it temporarily"""
     logger.info(f"Generating quiz for lesson {lesson_id} by user {current_user.id}")
     
     # Verify user has access to this lesson and get lesson content
@@ -1139,7 +1145,25 @@ async def generate_quiz_for_lesson(
     # Generate quiz using AI with the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
-    return {"questions": quiz_questions}
+    # Generate a unique quiz ID
+    quiz_id = f"{current_user.id}_{lesson_id}_{int(datetime.utcnow().timestamp())}"
+    
+    # Store the quiz temporarily (in production, use Redis or database)
+    quiz_storage[quiz_id] = {
+        "questions": quiz_questions,
+        "user_id": current_user.id,
+        "lesson_id": lesson_id,
+        "created_at": datetime.utcnow()
+    }
+    
+    # Clean up old quizzes (older than 1 hour)
+    cleanup_time = datetime.utcnow() - timedelta(hours=1)
+    for key in list(quiz_storage.keys()):
+        if quiz_storage[key]["created_at"] < cleanup_time:
+            del quiz_storage[key]
+    
+    logger.info(f"Quiz generated and stored with ID: {quiz_id}")
+    return {"questions": quiz_questions, "quiz_id": quiz_id}
 
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
 async def submit_quiz(
@@ -1148,11 +1172,12 @@ async def submit_quiz(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Submit quiz answers and get results"""
+    """Submit quiz answers and get results - FIXED VERSION"""
     logger.info(f"Submitting quiz for lesson {lesson_id} by user {current_user.id}")
     logger.info(f"User answers: {submission.answers}")
+    logger.info(f"Quiz ID: {submission.quiz_id}")
     
-    # Verify user has access to this lesson and get lesson content
+    # Verify user has access to this lesson and get lesson
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         logger.error(f"Lesson not found: {lesson_id}")
@@ -1173,8 +1198,23 @@ async def submit_quiz(
         logger.error(f"Quiz is not enabled for lesson {lesson_id}")
         raise HTTPException(status_code=400, detail="Quiz is not enabled for this lesson")
     
-    # Generate the same quiz again to get correct answers using the actual lesson content
-    quiz_questions = await generate_quiz(lesson.content)
+    # Retrieve the stored quiz questions using quiz_id
+    quiz_questions = None
+    if submission.quiz_id and submission.quiz_id in quiz_storage:
+        stored_quiz = quiz_storage[submission.quiz_id]
+        # Verify the quiz belongs to this user and lesson
+        if stored_quiz["user_id"] == current_user.id and stored_quiz["lesson_id"] == lesson_id:
+            quiz_questions = stored_quiz["questions"]
+            # Remove the quiz from storage after use
+            del quiz_storage[submission.quiz_id]
+            logger.info(f"Retrieved stored quiz with ID: {submission.quiz_id}")
+        else:
+            logger.warning(f"Quiz ID mismatch or unauthorized access: {submission.quiz_id}")
+    
+    # If no stored quiz found, generate a new one (fallback)
+    if not quiz_questions:
+        logger.warning(f"No stored quiz found for ID: {submission.quiz_id}, generating new quiz")
+        quiz_questions = await generate_quiz(lesson.content)
     
     # Validate user answers length
     if len(submission.answers) != 5:
@@ -2752,8 +2792,6 @@ async def download_lesson_pdf(
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
 
 # Add this to your backend code (after the existing quiz endpoints)
-import asyncio
-
 class QuizQuestionResponse(BaseModel):
     question: str
     options: List[str]
