@@ -390,7 +390,8 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
         "https://online-yze5-myir9uasl-dariusmumberes-projects.vercel.app",
-        "https://elearning-bvsj.onrender.com",  # Add your own domain
+        "https://online-zcsr.vercel.app",
+        "https://elearning-1-fyf2.onrender.com",  # Add your own domain
     ],
     allow_credentials=True,
     allow_methods=["*"],
