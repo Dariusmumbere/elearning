@@ -44,18 +44,11 @@ import hashlib
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
-
-# Gemini configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash')
-
 # Backblaze B2 Configuration - PRIVATE BUCKET
 B2_BUCKET_NAME = "uploads-dir"
 B2_ENDPOINT_URL = "https://s3.us-east-005.backblazeb2.com"
-B2_KEY_ID = "0055ca7845641d30000000002"
-B2_APPLICATION_KEY = "K005NNeGM9r28ujQ3jvNEQy2zUiu0TI"
+B2_KEY_ID = os.getenv("B2_KEY_ID", "0055ca7845641d30000000002")
+B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "K005NNeGM9r28ujQ3jvNEQy2zUiu0TI")
 
 # Initialize B2 client
 b2_client = boto3.client(
@@ -66,7 +59,7 @@ b2_client = boto3.client(
 )
 
 # Database configuration (using your credentials)
-DATABASE_URL = "postgresql://coderise_hqlk_user:Meoza9iH0JBABIGxfTNgJnvqp60wpIm4@dpg-d5fdjr0gjchc73f3pio0-a/coderise_hqlk"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://coderise_hqlk_user:Meoza9iH0JBABIGxfTNgJnvqp60wpIm4@dpg-d5fdjr0gjchc73f3pio0-a/coderise_hqlk")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -275,6 +268,7 @@ class LessonResponse(BaseModel):
     video_url: Optional[str] = None
     video_filename: Optional[str] = None
     has_quiz: bool
+    completed: Optional[bool] = False
     
     class Config:
         orm_mode = True
@@ -321,6 +315,7 @@ class CertificateResponse(BaseModel):
     id: int
     user_id: int
     course_id: int
+    course_title: Optional[str] = None
     issued_at: datetime
     certificate_hash: str
     download_url: Optional[str] = None
@@ -378,7 +373,7 @@ def migrate_has_quiz_default(db: Session):
         raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 # Auth setup - USING ARGON2 INSTEAD OF BCRYPT
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 VIDEO_TOKEN_EXPIRE_MINUTES = 60  # Shorter lifespan for video tokens
@@ -395,6 +390,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
         "https://online-yze5-myir9uasl-dariusmumberes-projects.vercel.app",
+        "https://elearning-bvsj.onrender.com",  # Add your own domain
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -549,6 +545,15 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
     """Generate a quiz using Gemini AI based on lesson content"""
     try:
+        # Configure Gemini if API key is available
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            logger.warning("GEMINI_API_KEY not set, using fallback quiz")
+            return create_fallback_quiz(lesson_content)
+        
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
         prompt = f"""
         Based on the following lesson content, generate exactly 5 multiple-choice questions with 4 options each.
         The questions should test understanding of key concepts from the lesson.
@@ -869,7 +874,7 @@ def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
     progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
     return completed_lessons == total_lessons, completed_lessons, total_lessons, progress_percentage
 
-# NEW: Robust Video Streaming Endpoint with Debugging Logs
+# NEW: FIXED Video Streaming Endpoint with Enhanced Error Handling
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
     filename: str,
@@ -918,29 +923,29 @@ async def stream_video(
             logger.error(f"User {user_id} not enrolled in course {lesson.module.course_id}")
             raise HTTPException(status_code=403, detail="Not enrolled in this course")
 
-        # Compare filenames (robust check using pathlib)
-        requested_filename = Path(filename).name
-        expected_filename = Path(lesson.video_filename).name
+        # Check if video filename exists
+        if not lesson.video_filename:
+            logger.error(f"No video filename found for lesson {lesson_id}")
+            raise HTTPException(status_code=404, detail="Video not found for this lesson")
 
-        if requested_filename != expected_filename:
-            logger.error(f"Filename mismatch: requested {requested_filename}, expected {expected_filename}")
-            raise HTTPException(status_code=403, detail="Invalid video access")
+        # Use the filename from the database (not from the URL parameter)
+        object_key = lesson.video_filename
+        logger.info(f"Using object key from database: {object_key}")
 
-        # Confirm file exists in B2 before streaming
+        # Check if file exists in B2
         try:
-            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
+            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=object_key)
             file_size = head_response['ContentLength']
-            content_type = head_response['ContentType']
+            content_type = head_response['ContentType'] or 'video/mp4'
             logger.info(f"File exists in B2! Size: {file_size} bytes, Type: {content_type}")
         except ClientError as e:
             logger.error(f"B2 HEAD Error: {e}")
-            raise HTTPException(status_code=404, detail="Video file not found in B2")
+            raise HTTPException(status_code=404, detail=f"Video file not found in storage: {str(e)}")
 
-        object_key = lesson.video_filename
         range_header = request.headers.get("Range")
         logger.info(f"Range header: {range_header}")
 
-        # Handle range requests
+        # Handle range requests (for streaming)
         if range_header:
             try:
                 # Parse range header
@@ -975,7 +980,8 @@ async def stream_video(
                     'Content-Range': f'bytes {start}-{end}/{file_size}',
                     'Accept-Ranges': 'bytes',
                     'Content-Length': str(content_length),
-                    'Content-Type': content_type
+                    'Content-Type': content_type,
+                    'Cache-Control': 'public, max-age=3600'
                 }
 
                 logger.info(f"Streaming range response with headers: {headers}")
@@ -1016,7 +1022,8 @@ async def stream_video(
             headers = {
                 'Accept-Ranges': 'bytes',
                 'Content-Length': str(file_size),
-                'Content-Type': content_type
+                'Content-Type': content_type,
+                'Cache-Control': 'public, max-age=3600'
             }
 
             logger.info(f"Streaming full video with headers: {headers}")
@@ -1051,7 +1058,6 @@ async def stream_video(
     except Exception as e:
         logger.error(f"Unexpected error in stream_video: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-        
 
 # NEW: Get video access token endpoint
 @app.get("/video-token/{lesson_id}", response_model=VideoTokenResponse)
@@ -1124,6 +1130,11 @@ async def generate_quiz_for_lesson(
         logger.error(f"Lesson {lesson_id} has no content to generate quiz from")
         raise HTTPException(status_code=400, detail="Lesson has no content to generate quiz from")
     
+    # Check if quiz is enabled for this lesson
+    if not lesson.has_quiz:
+        logger.error(f"Quiz is not enabled for lesson {lesson_id}")
+        raise HTTPException(status_code=400, detail="Quiz is not enabled for this lesson")
+    
     # Generate quiz using AI with the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
@@ -1155,6 +1166,11 @@ async def submit_quiz(
     if not enrollment:
         logger.error(f"User {current_user.id} not enrolled in course {lesson.module.course_id}")
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
+    
+    # Check if quiz is enabled for this lesson
+    if not lesson.has_quiz:
+        logger.error(f"Quiz is not enabled for lesson {lesson_id}")
+        raise HTTPException(status_code=400, detail="Quiz is not enabled for this lesson")
     
     # Generate the same quiz again to get correct answers using the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
@@ -1279,7 +1295,14 @@ async def check_certificate_eligibility(
         # Generate download URL for existing certificate
         download_url = None
         if existing_certificate.pdf_filename:
-            download_url = await generate_presigned_url(existing_certificate.pdf_filename)
+            try:
+                download_url = await generate_presigned_url(existing_certificate.pdf_filename)
+            except Exception as e:
+                logger.error(f"Error generating presigned URL: {e}")
+        
+        # Get course title
+        course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+        course_title = course.title if course else None
         
         return CertificateEligibilityResponse(
             eligible=True,
@@ -1291,6 +1314,7 @@ async def check_certificate_eligibility(
                 id=existing_certificate.id,
                 user_id=existing_certificate.user_id,
                 course_id=existing_certificate.course_id,
+                course_title=course_title,
                 issued_at=existing_certificate.issued_at,
                 certificate_hash=existing_certificate.certificate_hash,
                 download_url=download_url
@@ -1399,6 +1423,7 @@ async def claim_certificate(
         id=certificate.id,
         user_id=certificate.user_id,
         course_id=certificate.course_id,
+        course_title=course.title,
         issued_at=certificate.issued_at,
         certificate_hash=certificate.certificate_hash,
         download_url=download_url
@@ -1419,14 +1444,23 @@ async def get_user_certificates(
     # Generate download URLs for each certificate
     certificate_responses = []
     for certificate in certificates:
+        # Get course details
+        course = db.query(CourseModel).filter(CourseModel.id == certificate.course_id).first()
+        if not course:
+            continue
+            
         download_url = None
         if certificate.pdf_filename:
-            download_url = await generate_presigned_url(certificate.pdf_filename)
+            try:
+                download_url = await generate_presigned_url(certificate.pdf_filename)
+            except Exception as e:
+                logger.error(f"Error generating presigned URL for certificate {certificate.id}: {e}")
         
         certificate_responses.append(CertificateResponse(
             id=certificate.id,
             user_id=certificate.user_id,
             course_id=certificate.course_id,
+            course_title=course.title,
             issued_at=certificate.issued_at,
             certificate_hash=certificate.certificate_hash,
             download_url=download_url
@@ -1683,7 +1717,7 @@ async def create_lesson(
     title: str = Form(...),
     content: str = Form(None),
     order: int = Form(1),
-    has_quiz: bool = Form(False),
+    has_quiz: bool = Form(True),
     video_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -1719,7 +1753,7 @@ async def create_lesson(
         
         # Upload to Backblaze B2
         video_filename = await upload_to_b2(video_file, "lessons")
-        video_url = await generate_presigned_url(video_filename)
+        video_url = await generate_presigned_url(video_filename, expiration=3600)
         logger.info(f"Video uploaded: {video_filename}")
     
     # Create the lesson
@@ -1784,7 +1818,7 @@ async def get_module_lessons(
         # Generate presigned URL for video if it exists
         video_url = None
         if lesson.video_filename:
-            video_url = await generate_presigned_url(lesson.video_filename)
+            video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
         
         lesson_data = {
             "id": lesson.id,
@@ -1891,11 +1925,16 @@ async def get_my_courses(
         if course.image_filename:
             image_url = await generate_presigned_url(course.image_filename)
         
+        # Get instructor name
+        instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
+        instructor_name = instructor.full_name if instructor else "Unknown Instructor"
+        
         course_dict = {
             "id": course.id,
             "title": course.title,
             "description": course.description,
             "instructor_id": course.instructor_id,
+            "instructor_name": instructor_name,
             "created_at": course.created_at,
             "is_published": course.is_published,
             "image_url": image_url
@@ -1930,6 +1969,7 @@ async def get_instructor_courses(
             "title": course.title,
             "description": course.description,
             "instructor_id": course.instructor_id,
+            "instructor_name": current_user.full_name,
             "created_at": course.created_at,
             "is_published": course.is_published,
             "image_url": image_url
@@ -1990,12 +2030,17 @@ async def update_course(
     if course.image_filename:
         image_url = await generate_presigned_url(course.image_filename)
     
+    # Get instructor name
+    instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
+    instructor_name = instructor.full_name if instructor else "Unknown Instructor"
+    
     # Return the course
     course_response = {
         "id": course.id,
         "title": course.title,
         "description": course.description,
         "instructor_id": course.instructor_id,
+        "instructor_name": instructor_name,
         "created_at": course.created_at,
         "is_published": course.is_published,
         "image_url": image_url
@@ -2008,18 +2053,35 @@ async def update_course(
 @app.get("/lessons/{lesson_id}", response_model=LessonResponse)
 async def get_lesson(
     lesson_id: int,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    logger.info(f"Fetching lesson: {lesson_id}")
+    logger.info(f"Fetching lesson: {lesson_id} by user: {current_user.email}")
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         logger.error(f"Lesson not found: {lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
     
+    # Check if user is enrolled in the course
+    module = db.query(ModuleModel).filter(ModuleModel.id == lesson.module_id).first()
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == module.course_id
+    ).first()
+    
+    completed = False
+    if enrollment:
+        progress = db.query(ProgressModel).filter(
+            ProgressModel.enrollment_id == enrollment.id,
+            ProgressModel.lesson_id == lesson_id,
+            ProgressModel.completed == True
+        ).first()
+        completed = progress is not None
+    
     # Generate presigned URL for video if it exists
     video_url = None
     if lesson.video_filename:
-        video_url = await generate_presigned_url(lesson.video_filename)
+        video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
     
     response_data = {
         "id": lesson.id,
@@ -2029,7 +2091,8 @@ async def get_lesson(
         "module_id": lesson.module_id,
         "has_quiz": lesson.has_quiz,
         "video_url": video_url,
-        "video_filename": lesson.video_filename
+        "video_filename": lesson.video_filename,
+        "completed": completed
     }
     
     logger.info(f"Lesson found: {lesson_id}")
@@ -2088,7 +2151,7 @@ async def update_lesson(
         
         # Upload new video to B2
         lesson.video_filename = await upload_to_b2(video_file, "lessons")
-        lesson.video_url = await generate_presigned_url(lesson.video_filename)
+        lesson.video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
     
     db.commit()
     db.refresh(lesson)
@@ -2160,6 +2223,11 @@ def delete_module(
         logger.error(f"Module not found or permission denied: {module_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
+    # Delete associated lessons and their videos
+    for lesson in module.lessons:
+        if lesson.video_filename:
+            asyncio.run(delete_from_b2(lesson.video_filename))
+    
     db.delete(module)
     db.commit()
     logger.info(f"Module deleted successfully: {module_id}")
@@ -2226,8 +2294,15 @@ def mark_lesson_complete(
     
     if progress:
         # Already completed
-        logger.info(f"Lesson already completed: {lesson_id} by user: {current_user.email}")
-        return {"message": "Lesson already completed"}
+        if progress.completed:
+            logger.info(f"Lesson already completed: {lesson_id} by user: {current_user.email}")
+            return {"message": "Lesson already completed"}
+        else:
+            progress.completed = True
+            progress.completed_at = datetime.utcnow()
+            db.commit()
+            logger.info(f"Lesson marked as complete: {lesson_id} by user: {current_user.email}")
+            return {"message": "Lesson marked as complete"}
     
     # Create new progress record
     progress = ProgressModel(
@@ -2390,9 +2465,11 @@ def check_lesson_access(
         ProgressModel.lesson_id == lesson_id
     ).first()
     
+    current_lesson_completed = current_progress.completed if current_progress else False
+    
     return {
         "can_access": can_access,
-        "current_lesson_completed": current_progress.completed if current_progress else False,
+        "current_lesson_completed": current_lesson_completed,
         "message": "Access granted" if can_access else "Complete previous lessons first"
     }
 
@@ -2601,20 +2678,63 @@ async def download_lesson_pdf(
     """
     
     try:
-        # Configure pdfkit (you might need to install wkhtmltopdf on your server)
-        config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')  # Adjust path as needed
+        # Check if pdfkit is available
+        import subprocess
+        try:
+            subprocess.run(['wkhtmltopdf', '--version'], capture_output=True, check=True)
+            wkhtmltopdf_available = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            wkhtmltopdf_available = False
+            logger.warning("wkhtmltopdf not found, using fallback PDF generation")
         
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-            # Generate PDF
-            pdfkit.from_string(html_content, tmp_file.name, configuration=config)
+        if wkhtmltopdf_available:
+            # Configure pdfkit
+            config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')
             
-            # Read the generated PDF
-            with open(tmp_file.name, 'rb') as f:
-                pdf_data = f.read()
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+                # Generate PDF
+                pdfkit.from_string(html_content, tmp_file.name, configuration=config)
+                
+                # Read the generated PDF
+                with open(tmp_file.name, 'rb') as f:
+                    pdf_data = f.read()
+                
+                # Clean up
+                os.unlink(tmp_file.name)
+        else:
+            # Fallback: Create a simple text-based PDF using reportlab
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter)
+            styles = getSampleStyleSheet()
+            elements = []
             
-            # Clean up
-            os.unlink(tmp_file.name)
+            # Add title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Title'],
+                fontSize=24,
+                spaceAfter=30,
+                textColor=colors.HexColor('#2C3E50')
+            )
+            elements.append(Paragraph(lesson.title, title_style))
+            
+            # Add content
+            if lesson.content:
+                content_style = ParagraphStyle(
+                    'CustomNormal',
+                    parent=styles['Normal'],
+                    fontSize=12,
+                    spaceAfter=12
+                )
+                elements.append(Paragraph(lesson.content, content_style))
+            else:
+                elements.append(Paragraph("No content available for this lesson.", styles['Normal']))
+            
+            # Build PDF
+            doc.build(elements)
+            pdf_data = buffer.getvalue()
+            buffer.close()
         
         # Return PDF as downloadable file
         return Response(
@@ -2631,6 +2751,7 @@ async def download_lesson_pdf(
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
 
 # Add this to your backend code (after the existing quiz endpoints)
+import asyncio
 
 class QuizQuestionResponse(BaseModel):
     question: str
@@ -2714,44 +2835,6 @@ async def startup_event():
     finally:
         db.close()
 
-# Add to your existing backend code
-
-@app.get("/certificates", response_model=List[CertificateResponse])
-async def get_user_certificates(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Get all certificates for the current user with course details"""
-    logger.info(f"Getting certificates for user {current_user.id}")
-    
-    certificates = db.query(CertificateModel).filter(
-        CertificateModel.user_id == current_user.id
-    ).all()
-    
-    # Generate download URLs and include course titles
-    certificate_responses = []
-    for certificate in certificates:
-        # Get course details
-        course = db.query(CourseModel).filter(CourseModel.id == certificate.course_id).first()
-        if not course:
-            continue
-            
-        download_url = None
-        if certificate.pdf_filename:
-            download_url = await generate_presigned_url(certificate.pdf_filename)
-        
-        certificate_responses.append({
-            "id": certificate.id,
-            "user_id": certificate.user_id,
-            "course_id": certificate.course_id,
-            "course_title": course.title,
-            "issued_at": certificate.issued_at,
-            "certificate_hash": certificate.certificate_hash,
-            "download_url": download_url
-        })
-    
-    return certificate_responses
-
 @app.get("/certificates/{certificate_hash}/download")
 async def download_certificate(
     certificate_hash: str,
@@ -2781,12 +2864,25 @@ async def download_certificate(
             Key=certificate.pdf_filename
         )
         
+        # Get file size
+        file_size = response['ContentLength']
+        content_type = response['ContentType'] or 'application/pdf'
+        
         # Stream the file directly to the client
+        def generate_chunks():
+            with response['Body'] as stream:
+                while True:
+                    chunk = stream.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+        
         return StreamingResponse(
-            response['Body'],
-            media_type='application/pdf',
+            generate_chunks(),
+            media_type=content_type,
             headers={
-                'Content-Disposition': f'attachment; filename="certificate-{certificate_hash}.pdf"'
+                'Content-Disposition': f'attachment; filename="certificate-{certificate_hash}.pdf"',
+                'Content-Length': str(file_size)
             }
         )
     except ClientError as e:
@@ -2799,9 +2895,6 @@ async def b2_proxy(filename: str, db: Session = Depends(get_db)):
     Proxy endpoint to serve private B2 files without exposing presigned URLs
     """
     try:
-        # Verify the file exists and user has access (optional)
-        # For course images, you might want to check if user can access the course
-        
         # Generate presigned URL
         presigned_url = await generate_presigned_url(filename)
         
@@ -2813,7 +2906,8 @@ async def b2_proxy(filename: str, db: Session = Depends(get_db)):
                 response.iter_content(chunk_size=8192),
                 media_type=response.headers.get('content-type', 'application/octet-stream'),
                 headers={
-                    'Content-Disposition': response.headers.get('content-disposition', 'inline')
+                    'Content-Disposition': response.headers.get('content-disposition', 'inline'),
+                    'Content-Length': response.headers.get('content-length', '')
                 }
             )
         else:
@@ -2827,6 +2921,51 @@ async def b2_proxy(filename: str, db: Session = Depends(get_db)):
 def health_check():
     """Health check endpoint to verify the API is running"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+
+# Debug endpoint to check video access
+@app.get("/debug/video/{lesson_id}")
+async def debug_video_access(
+    lesson_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to check video access and file information"""
+    logger.info(f"Debug video access for lesson: {lesson_id} by user: {current_user.email}")
+    
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        return {"error": "Lesson not found"}
+    
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id
+    ).first()
+    
+    # Check if file exists in B2
+    b2_info = {}
+    if lesson.video_filename:
+        try:
+            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=lesson.video_filename)
+            b2_info = {
+                "exists": True,
+                "size": head_response['ContentLength'],
+                "content_type": head_response['ContentType'],
+                "last_modified": head_response['LastModified']
+            }
+        except ClientError as e:
+            b2_info = {
+                "exists": False,
+                "error": str(e)
+            }
+    
+    return {
+        "lesson_id": lesson_id,
+        "lesson_title": lesson.title,
+        "video_filename": lesson.video_filename,
+        "enrolled": enrollment is not None,
+        "b2_info": b2_info,
+        "video_token_url": f"/video-token/{lesson_id}"
+    }
 
 if __name__ == "__main__":
     import uvicorn
