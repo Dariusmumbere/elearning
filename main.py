@@ -40,6 +40,8 @@ import base64
 from io import BytesIO
 import hashlib
 import asyncio
+import redis
+import pickle
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +60,19 @@ b2_client = boto3.client(
     aws_access_key_id=B2_KEY_ID,
     aws_secret_access_key=B2_APPLICATION_KEY
 )
+
+# Redis configuration for caching quiz questions
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+    redis_client.ping()
+    logger.info("Redis connected successfully")
+except Exception as e:
+    logger.warning(f"Redis connection failed: {e}. Using in-memory cache.")
+    redis_client = None
+
+# In-memory cache fallback
+quiz_cache = {}
 
 # Database configuration (using your credentials)
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://coderise_hqlk_user:Meoza9iH0JBABIGxfTNgJnvqp60wpIm4@dpg-d5fdjr0gjchc73f3pio0-a/coderise_hqlk")
@@ -180,21 +195,6 @@ class CertificateModel(Base):
     user = relationship("UserModel", back_populates="certificates")
     course = relationship("CourseModel", back_populates="certificates")
 
-# NEW: Quiz Session table to store generated quiz questions before submission
-class QuizSessionModel(Base):
-    __tablename__ = "quiz_sessions"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    lesson_id = Column(Integer, ForeignKey("lessons.id"))
-    session_id = Column(String, unique=True, index=True)  # Unique session ID
-    questions = Column(JSON)  # Store the generated quiz questions
-    created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime)  # When the session expires
-    
-    user = relationship("UserModel")
-    lesson = relationship("LessonModel")
-
 # Create tables
 Base.metadata.create_all(bind=engine)
 
@@ -303,12 +303,12 @@ class QuizRequest(BaseModel):
     lesson_content: str
 
 class QuizResponse(BaseModel):
-    session_id: str  # Session ID to track this specific quiz
     questions: List[QuizQuestion]
+    quiz_id: str  # Add this to track the specific quiz instance
 
 class QuizSubmission(BaseModel):
-    session_id: str  # Session ID that identifies which quiz questions to use
     answers: List[int]  # List of selected option indices
+    quiz_id: str  # Add this to identify which quiz is being submitted
 
 class QuizResult(BaseModel):
     score: int
@@ -316,6 +316,7 @@ class QuizResult(BaseModel):
     passed: bool
     correct_answers: List[int]
     attempt_id: int
+    questions: List[QuizQuestion]  # Include the questions for review
 
 class QuizAttemptResponse(BaseModel):
     id: int
@@ -324,6 +325,26 @@ class QuizAttemptResponse(BaseModel):
     score: int
     passed: bool
     created_at: datetime
+    
+    class Config:
+        orm_mode = True
+
+class QuizQuestionResponse(BaseModel):
+    question: str
+    options: List[str]
+    user_answer: int
+    correct_answer: int
+    is_correct: bool
+
+class QuizAttemptDetailResponse(BaseModel):
+    id: int
+    user_id: int
+    lesson_id: int
+    score: int
+    total: int
+    passed: bool
+    created_at: datetime
+    questions: List[QuizQuestionResponse]
     
     class Config:
         orm_mode = True
@@ -348,26 +369,6 @@ class CertificateEligibilityResponse(BaseModel):
     progress_percentage: float
     message: Optional[str] = None
     existing_certificate: Optional[CertificateResponse] = None
-
-class QuizQuestionResponse(BaseModel):
-    question: str
-    options: List[str]
-    user_answer: int  # Index of user's selected option
-    correct_answer: int  # Index of correct option
-    is_correct: bool
-
-class QuizAttemptDetailResponse(BaseModel):
-    id: int
-    user_id: int
-    lesson_id: int
-    score: int
-    total: int
-    passed: bool
-    created_at: datetime
-    questions: List[QuizQuestionResponse]
-    
-    class Config:
-        orm_mode = True
 
 def migrate_has_quiz_default(db: Session):
     """
@@ -413,9 +414,8 @@ def migrate_has_quiz_default(db: Session):
 # Auth setup - USING ARGON2 INSTEAD OF BCRYPT
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours instead of 30 minutes
 VIDEO_TOKEN_EXPIRE_MINUTES = 60  # Shorter lifespan for video tokens
-QUIZ_SESSION_EXPIRE_MINUTES = 60  # Quiz session expiration time
 
 # Use Argon2 instead of bcrypt to avoid the 72-byte password limit
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
@@ -467,7 +467,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -580,6 +580,51 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
         return url
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
+
+# Quiz Cache Helper Functions
+def get_quiz_cache_key(user_id: int, lesson_id: int, quiz_id: str = None):
+    """Generate a cache key for quiz questions"""
+    if quiz_id:
+        return f"quiz:{user_id}:{lesson_id}:{quiz_id}"
+    return f"quiz:{user_id}:{lesson_id}"
+
+def cache_quiz_questions(user_id: int, lesson_id: int, questions: List[dict], quiz_id: str):
+    """Cache quiz questions for later retrieval during submission"""
+    cache_key = get_quiz_cache_key(user_id, lesson_id, quiz_id)
+    
+    try:
+        # Store with 1-hour expiration
+        if redis_client:
+            redis_client.setex(cache_key, 3600, pickle.dumps(questions))
+        else:
+            quiz_cache[cache_key] = {
+                'questions': questions,
+                'expires': datetime.utcnow() + timedelta(hours=1)
+            }
+        logger.info(f"Cached quiz questions for user {user_id}, lesson {lesson_id}, quiz_id {quiz_id}")
+    except Exception as e:
+        logger.error(f"Error caching quiz questions: {e}")
+
+def get_cached_quiz_questions(user_id: int, lesson_id: int, quiz_id: str):
+    """Retrieve cached quiz questions"""
+    cache_key = get_quiz_cache_key(user_id, lesson_id, quiz_id)
+    
+    try:
+        if redis_client:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                return pickle.loads(cached_data)
+        else:
+            if cache_key in quiz_cache:
+                cached_item = quiz_cache[cache_key]
+                if cached_item['expires'] > datetime.utcnow():
+                    return cached_item['questions']
+                else:
+                    del quiz_cache[cache_key]
+    except Exception as e:
+        logger.error(f"Error retrieving cached quiz questions: {e}")
+    
+    return None
 
 # Quiz Helper Functions
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
@@ -704,59 +749,7 @@ def generate_certificate_hash(user_id: int, course_id: int) -> str:
     """Generate a unique hash for the certificate"""
     unique_string = f"{user_id}_{course_id}_{datetime.utcnow().isoformat()}_{uuid.uuid4()}"
     return hashlib.sha256(unique_string.encode()).hexdigest()[:16]  # Using first 16 chars for readability
-
-# NEW: Quiz Session Management Functions
-def create_quiz_session_id() -> str:
-    """Create a unique session ID for a quiz"""
-    return str(uuid.uuid4())
-
-async def store_quiz_session(db: Session, user_id: int, lesson_id: int, questions: List[dict]) -> str:
-    """Store quiz questions in a session and return session ID"""
-    # Clean up expired sessions
-    db.query(QuizSessionModel).filter(
-        QuizSessionModel.expires_at < datetime.utcnow()
-    ).delete(synchronize_session=False)
     
-    # Create session ID
-    session_id = create_quiz_session_id()
-    
-    # Create quiz session
-    quiz_session = QuizSessionModel(
-        user_id=user_id,
-        lesson_id=lesson_id,
-        session_id=session_id,
-        questions=questions,
-        expires_at=datetime.utcnow() + timedelta(minutes=QUIZ_SESSION_EXPIRE_MINUTES)
-    )
-    
-    db.add(quiz_session)
-    db.commit()
-    
-    return session_id
-
-async def get_quiz_session(db: Session, session_id: str, user_id: int, lesson_id: int) -> Optional[QuizSessionModel]:
-    """Retrieve a quiz session and validate it"""
-    quiz_session = db.query(QuizSessionModel).filter(
-        QuizSessionModel.session_id == session_id,
-        QuizSessionModel.user_id == user_id,
-        QuizSessionModel.lesson_id == lesson_id,
-        QuizSessionModel.expires_at > datetime.utcnow()
-    ).first()
-    
-    return quiz_session
-
-async def cleanup_expired_sessions(db: Session):
-    """Clean up expired quiz sessions"""
-    deleted_count = db.query(QuizSessionModel).filter(
-        QuizSessionModel.expires_at < datetime.utcnow()
-    ).delete(synchronize_session=False)
-    
-    if deleted_count > 0:
-        db.commit()
-        logger.info(f"Cleaned up {deleted_count} expired quiz sessions")
-    
-    return deleted_count
-
 # Certificate Helper Functions
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
     """Create a visually appealing certificate PDF with professional design"""
@@ -1198,7 +1191,7 @@ async def generate_quiz_for_lesson(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Generate a quiz for a specific lesson and store it in a session"""
+    """Generate a quiz for a specific lesson and cache it"""
     logger.info(f"Generating quiz for lesson {lesson_id} by user {current_user.id}")
     
     # Verify user has access to this lesson and get lesson content
@@ -1227,19 +1220,18 @@ async def generate_quiz_for_lesson(
         logger.error(f"Quiz is not enabled for lesson {lesson_id}")
         raise HTTPException(status_code=400, detail="Quiz is not enabled for this lesson")
     
-    # Clean up expired sessions first
-    await cleanup_expired_sessions(db)
+    # Generate a unique quiz ID
+    quiz_id = str(uuid.uuid4())
     
     # Generate quiz using AI with the actual lesson content
     quiz_questions = await generate_quiz(lesson.content)
     
-    # Store the quiz questions in a session
-    session_id = await store_quiz_session(db, current_user.id, lesson_id, quiz_questions)
+    # Cache the quiz questions with the quiz_id
+    cache_quiz_questions(current_user.id, lesson_id, quiz_questions, quiz_id)
     
-    logger.info(f"Quiz generated and stored with session ID: {session_id}")
     return {
-        "session_id": session_id,
-        "questions": quiz_questions
+        "questions": quiz_questions,
+        "quiz_id": quiz_id
     }
 
 @app.post("/lessons/{lesson_id}/submit-quiz", response_model=QuizResult)
@@ -1249,12 +1241,11 @@ async def submit_quiz(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Submit quiz answers and get results - USING STORED QUIZ QUESTIONS"""
+    """Submit quiz answers using cached questions"""
     logger.info(f"Submitting quiz for lesson {lesson_id} by user {current_user.id}")
-    logger.info(f"Session ID: {submission.session_id}")
-    logger.info(f"User answers: {submission.answers}")
+    logger.info(f"User answers: {submission.answers}, Quiz ID: {submission.quiz_id}")
     
-    # Verify user has access to this lesson
+    # Verify user has access to this lesson and get lesson content
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         logger.error(f"Lesson not found: {lesson_id}")
@@ -1275,18 +1266,15 @@ async def submit_quiz(
         logger.error(f"Quiz is not enabled for lesson {lesson_id}")
         raise HTTPException(status_code=400, detail="Quiz is not enabled for this lesson")
     
-    # Retrieve the stored quiz session
-    quiz_session = await get_quiz_session(db, submission.session_id, current_user.id, lesson_id)
+    # Get cached quiz questions using the quiz_id
+    quiz_questions = get_cached_quiz_questions(current_user.id, lesson_id, submission.quiz_id)
     
-    if not quiz_session:
-        logger.error(f"Quiz session not found or expired: {submission.session_id}")
+    if not quiz_questions:
+        logger.error(f"No cached quiz found for user {current_user.id}, lesson {lesson_id}, quiz_id {submission.quiz_id}")
         raise HTTPException(
             status_code=400, 
-            detail="Quiz session not found or expired. Please generate a new quiz."
+            detail="Quiz session expired or invalid. Please generate a new quiz."
         )
-    
-    # Get the stored quiz questions
-    quiz_questions = quiz_session.questions
     
     # Validate user answers length
     if len(submission.answers) != 5:
@@ -1299,7 +1287,7 @@ async def submit_quiz(
             logger.error(f"Invalid answer at position {i}: {answer}")
             raise HTTPException(status_code=400, detail=f"Answer {i+1} must be between 0 and 3")
     
-    # Calculate score using the stored quiz questions
+    # Calculate score using the cached questions
     score = 0
     correct_answers = []
     
@@ -1320,32 +1308,29 @@ async def submit_quiz(
     # Check if passed (at least 3 correct answers)
     passed = score >= 3
     
-    # Save quiz attempt with the SAME questions that were displayed to the user
+    # Save quiz attempt with the actual questions used
     quiz_attempt = QuizAttemptModel(
         user_id=current_user.id,
         lesson_id=lesson_id,
-        questions=quiz_questions,  # Use the stored questions
+        questions=quiz_questions,
         user_answers=submission.answers,
         score=score,
         passed=passed
     )
     
     db.add(quiz_attempt)
-    
-    # Delete the session after submission
-    db.delete(quiz_session)
-    
     db.commit()
     db.refresh(quiz_attempt)
     
-    logger.info(f"Quiz submitted: score {score}/5, passed: {passed}, attempt_id: {quiz_attempt.id}")
+    logger.info(f"Quiz submitted: score {score}/5, passed: {passed}")
     
     return {
         "score": score,
         "total": 5,
         "passed": passed,
         "correct_answers": correct_answers,
-        "attempt_id": quiz_attempt.id
+        "attempt_id": quiz_attempt.id,
+        "questions": quiz_questions  # Return the questions for review
     }
 
 @app.get("/lessons/{lesson_id}/quiz-attempts", response_model=List[QuizAttemptResponse])
@@ -1379,54 +1364,7 @@ async def get_quiz_attempts(
         QuizAttemptModel.lesson_id == lesson_id
     ).order_by(QuizAttemptModel.created_at.desc()).all()
     
-    logger.info(f"Found {len(attempts)} quiz attempts for lesson {lesson_id}")
     return attempts
-
-@app.get("/quiz-attempts/{attempt_id}", response_model=QuizAttemptDetailResponse)
-async def get_quiz_attempt_details(
-    attempt_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Get detailed information about a specific quiz attempt"""
-    logger.info(f"Getting quiz attempt details: {attempt_id} by user: {current_user.email}")
-    
-    # Get the quiz attempt
-    quiz_attempt = db.query(QuizAttemptModel).filter(
-        QuizAttemptModel.id == attempt_id,
-        QuizAttemptModel.user_id == current_user.id
-    ).first()
-    
-    if not quiz_attempt:
-        logger.error(f"Quiz attempt not found: {attempt_id} for user: {current_user.id}")
-        raise HTTPException(status_code=404, detail="Quiz attempt not found")
-    
-    # Build the detailed response using the questions that were ACTUALLY asked
-    questions_with_answers = []
-    for i, question_data in enumerate(quiz_attempt.questions):
-        user_answer = quiz_attempt.user_answers[i] if i < len(quiz_attempt.user_answers) else -1
-        is_correct = user_answer == question_data["correct_answer"]
-        
-        questions_with_answers.append(QuizQuestionResponse(
-            question=question_data["question"],
-            options=question_data["options"],
-            user_answer=user_answer,
-            correct_answer=question_data["correct_answer"],
-            is_correct=is_correct
-        ))
-    
-    logger.info(f"Returning quiz attempt details for attempt {attempt_id}")
-    
-    return QuizAttemptDetailResponse(
-        id=quiz_attempt.id,
-        user_id=quiz_attempt.user_id,
-        lesson_id=quiz_attempt.lesson_id,
-        score=quiz_attempt.score,
-        total=5,
-        passed=quiz_attempt.passed,
-        created_at=quiz_attempt.created_at,
-        questions=questions_with_answers
-    )
 
 # NEW: Certificate Endpoints
 @app.get("/courses/{course_id}/certificate/eligibility", response_model=CertificateEligibilityResponse)
@@ -2913,6 +2851,50 @@ async def download_lesson_pdf(
     except Exception as e:
         logger.error(f"PDF generation error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+@app.get("/quiz-attempts/{attempt_id}", response_model=QuizAttemptDetailResponse)
+async def get_quiz_attempt_details(
+    attempt_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get detailed information about a specific quiz attempt"""
+    logger.info(f"Getting quiz attempt details: {attempt_id} by user: {current_user.email}")
+    
+    # Get the quiz attempt
+    quiz_attempt = db.query(QuizAttemptModel).filter(
+        QuizAttemptModel.id == attempt_id,
+        QuizAttemptModel.user_id == current_user.id
+    ).first()
+    
+    if not quiz_attempt:
+        logger.error(f"Quiz attempt not found: {attempt_id} for user: {current_user.id}")
+        raise HTTPException(status_code=404, detail="Quiz attempt not found")
+    
+    # Build the detailed response
+    questions_with_answers = []
+    for i, question_data in enumerate(quiz_attempt.questions):
+        user_answer = quiz_attempt.user_answers[i] if i < len(quiz_attempt.user_answers) else -1
+        is_correct = user_answer == question_data["correct_answer"]
+        
+        questions_with_answers.append({
+            "question": question_data["question"],
+            "options": question_data["options"],
+            "user_answer": user_answer,
+            "correct_answer": question_data["correct_answer"],
+            "is_correct": is_correct
+        })
+    
+    return {
+        "id": quiz_attempt.id,
+        "user_id": quiz_attempt.user_id,
+        "lesson_id": quiz_attempt.lesson_id,
+        "score": quiz_attempt.score,
+        "total": 5,  # Always 5 questions
+        "passed": quiz_attempt.passed,
+        "created_at": quiz_attempt.created_at,
+        "questions": questions_with_answers
+    }
 
 @app.on_event("startup")
 async def startup_event():
