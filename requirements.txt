@@ -16,3 +16,4 @@ alembic
 pdfkit
 reportlab
 argon2-cffi
+redis
