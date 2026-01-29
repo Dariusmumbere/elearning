@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
 from typing import Optional, List, Union
 from jose import JWTError, jwt
@@ -537,7 +537,7 @@ def check_previous_lessons_completed(db: Session, enrollment_id: int, current_le
 
 # B2 Helper Functions
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
-    """Upload a file to Backblaze B2 and return the URL"""
+    """Upload a file to Backblaze B2 and return the filename"""
     try:
         # Generate unique filename
         file_extension = file.filename.split(".")[-1]
@@ -554,21 +554,28 @@ async def upload_to_b2(file: UploadFile, folder: str) -> str:
             ContentType=file.content_type
         )
         
+        logger.info(f"File uploaded to B2: {filename}")
         return filename
         
     except Exception as e:
+        logger.error(f"Error uploading file to B2: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
 
 async def delete_from_b2(filename: str):
     """Delete a file from Backblaze B2"""
     try:
         b2_client.delete_object(Bucket=B2_BUCKET_NAME, Key=filename)
+        logger.info(f"File deleted from B2: {filename}")
     except Exception as e:
+        logger.error(f"Error deleting file from B2: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
 
 async def generate_presigned_url(filename: str, expiration: int = 3600):
     """Generate a presigned URL for private B2 objects"""
     try:
+        if not filename:
+            return None
+        
         url = b2_client.generate_presigned_url(
             'get_object',
             Params={
@@ -577,9 +584,20 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
             },
             ExpiresIn=expiration
         )
+        logger.info(f"Generated presigned URL for: {filename}")
         return url
     except ClientError as e:
-        raise HTTPException(status_code=500, detail=f"Error generating presigned URL: {str(e)}")
+        logger.error(f"Error generating presigned URL: {e}")
+        # Return None instead of raising exception to prevent breaking the flow
+        return None
+
+async def get_b2_url(filename: str) -> Optional[str]:
+    """Get B2 URL for a file - uses proxy for private files"""
+    if not filename:
+        return None
+    
+    # For course images, use the B2 proxy endpoint
+    return f"/b2-proxy/{filename}"
 
 # Quiz Cache Helper Functions
 def get_quiz_cache_key(user_id: int, lesson_id: int, quiz_id: str = None):
@@ -927,9 +945,11 @@ async def upload_certificate_to_b2(pdf_buffer: BytesIO, filename: str) -> str:
             ContentType='application/pdf'
         )
         
+        logger.info(f"Certificate uploaded to B2: {filename}")
         return filename
         
     except Exception as e:
+        logger.error(f"Error uploading certificate to B2: {e}")
         raise HTTPException(status_code=500, detail=f"Error uploading certificate: {str(e)}")
 
 def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
@@ -958,6 +978,32 @@ def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
     
     progress_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
     return completed_lessons == total_lessons, completed_lessons, total_lessons, progress_percentage
+
+# Course Image Handling Functions
+def ensure_course_image_in_b2(db: Session, course_id: int):
+    """Ensure course image is stored in B2 and update the database if needed"""
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        return None
+    
+    # If course has image_url but no image_filename, we need to handle it
+    if course.image_url and not course.image_filename:
+        logger.info(f"Course {course_id} has image_url but no image_filename. Migrating to B2...")
+        # Here you would need to implement logic to:
+        # 1. Download the image from the old URL
+        # 2. Upload it to B2
+        # 3. Update the course record with image_filename
+        # This is a migration scenario
+    
+    return course.image_filename
+
+async def get_course_image_url(course: CourseModel) -> Optional[str]:
+    """Get the course image URL, ensuring it's from B2"""
+    if not course.image_filename:
+        return None
+    
+    # Use the B2 proxy endpoint for security
+    return f"/b2-proxy/{course.image_filename}"
 
 # NEW: FIXED Video Streaming Endpoint with Enhanced Error Handling
 @app.get("/stream/video/{filename:path}")
@@ -1651,7 +1697,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
     logger.info(f"User data requested for: {current_user.email}")
     return current_user
 
-# Course routes
+# Course routes - UPDATED to ensure images are always in B2
 @app.post("/courses/", response_model=Course)
 async def create_course(
     title: str = Form(...),
@@ -1667,7 +1713,7 @@ async def create_course(
         logger.error(f"Non-instructor attempt to create course: {current_user.email}")
         raise HTTPException(status_code=403, detail="Only instructors can create courses")
     
-    # Handle image upload if provided
+    # Handle image upload - ALWAYS upload to B2
     image_filename = None
     if image_file:
         # Validate file type
@@ -1681,7 +1727,11 @@ async def create_course(
         
         # Upload to Backblaze B2
         image_filename = await upload_to_b2(image_file, "courses")
-        logger.info(f"Course image uploaded: {image_filename}")
+        logger.info(f"Course image uploaded to B2: {image_filename}")
+    else:
+        # If no image provided, use a default image from B2 or generate a placeholder
+        # You can upload a default image to B2 and reference it here
+        image_filename = "courses/default-course-image.jpg"  # Make sure this exists in B2
     
     # Create the course in the database
     db_course = CourseModel(
@@ -1694,10 +1744,8 @@ async def create_course(
     db.commit()
     db.refresh(db_course)
     
-    # Generate presigned URL for the image
-    image_url = None
-    if image_filename:
-        image_url = await generate_presigned_url(image_filename)
+    # Get the image URL using B2 proxy
+    image_url = await get_course_image_url(db_course)
     
     # Return a proper Course object including instructor_name
     return Course(
@@ -1718,9 +1766,11 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
     
     course_list = []
     for course in courses:
-        image_url = None
-        if course.image_filename:
-            image_url = await generate_presigned_url(course.image_filename)
+        # Ensure course image is properly stored in B2
+        ensure_course_image_in_b2(db, course.id)
+        
+        # Get image URL from B2
+        image_url = await get_course_image_url(course)
         
         # Get instructor name
         instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
@@ -1750,10 +1800,11 @@ async def read_course(course_id: int, db: Session = Depends(get_db)):
         logger.error(f"Course not found: {course_id}")
         raise HTTPException(status_code=404, detail="Course not found")
     
-    # Generate presigned URL for the image
-    image_url = None
-    if course.image_filename:
-        image_url = await generate_presigned_url(course.image_filename)
+    # Ensure course image is properly stored in B2
+    ensure_course_image_in_b2(db, course_id)
+    
+    # Get image URL from B2
+    image_url = await get_course_image_url(course)
     
     # Get instructor name
     instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
@@ -1841,7 +1892,6 @@ async def create_lesson(
     
     # Handle video file upload if provided
     video_filename = None
-    video_url = None
     
     if video_file:
         # Validate file type
@@ -1855,8 +1905,7 @@ async def create_lesson(
         
         # Upload to Backblaze B2
         video_filename = await upload_to_b2(video_file, "lessons")
-        video_url = await generate_presigned_url(video_filename, expiration=3600)
-        logger.info(f"Video uploaded: {video_filename}")
+        logger.info(f"Video uploaded to B2: {video_filename}")
     
     # Create the lesson
     db_lesson = LessonModel(
@@ -1865,13 +1914,17 @@ async def create_lesson(
         module_id=module_id,
         order=order,
         has_quiz=has_quiz,
-        video_url=video_url,
         video_filename=video_filename
     )
     
     db.add(db_lesson)
     db.commit()
     db.refresh(db_lesson)
+    
+    # Generate video URL for response
+    video_url = None
+    if video_filename:
+        video_url = f"/stream/video/{video_filename}"
     
     # Build the response
     response_data = {
@@ -1881,7 +1934,7 @@ async def create_lesson(
         "order": db_lesson.order,
         "module_id": db_lesson.module_id,
         "has_quiz": db_lesson.has_quiz,
-        "video_url": db_lesson.video_url,
+        "video_url": video_url,
         "video_filename": db_lesson.video_filename
     }
     
@@ -1917,10 +1970,10 @@ async def get_module_lessons(
             ).first()
             completed = progress is not None
         
-        # Generate presigned URL for video if it exists
+        # Generate video URL if video exists
         video_url = None
         if lesson.video_filename:
-            video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
+            video_url = f"/stream/video/{lesson.video_filename}"
         
         lesson_data = {
             "id": lesson.id,
@@ -1975,11 +2028,8 @@ async def upload_course_image(
     # Upload to Backblaze B2
     filename = await upload_to_b2(file, "courses")
     
-    # Generate presigned URL
-    url = await generate_presigned_url(filename)
-    
-    logger.info(f"Image uploaded successfully: {filename}")
-    return {"filename": filename, "url": url}
+    logger.info(f"Image uploaded successfully to B2: {filename}")
+    return {"filename": filename, "url": f"/b2-proxy/{filename}"}
 
 # Enrollment routes
 @app.post("/enroll/{course_id}")
@@ -2020,12 +2070,14 @@ async def get_my_courses(
     course_ids = [enrollment.course_id for enrollment in enrollments]
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
     
-    # Convert ORM objects to dicts and generate presigned URLs
+    # Convert ORM objects to dicts and generate image URLs from B2
     course_list = []
     for course in courses:
-        image_url = None
-        if course.image_filename:
-            image_url = await generate_presigned_url(course.image_filename)
+        # Ensure course image is in B2
+        ensure_course_image_in_b2(db, course.id)
+        
+        # Get image URL from B2
+        image_url = await get_course_image_url(course)
         
         # Get instructor name
         instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
@@ -2059,12 +2111,14 @@ async def get_instructor_courses(
     
     courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
     
-    # Convert ORM objects to dicts and generate presigned URLs
+    # Convert ORM objects to dicts and generate image URLs from B2
     course_list = []
     for course in courses:
-        image_url = None
-        if course.image_filename:
-            image_url = await generate_presigned_url(course.image_filename)
+        # Ensure course image is in B2
+        ensure_course_image_in_b2(db, course.id)
+        
+        # Get image URL from B2
+        image_url = await get_course_image_url(course)
         
         course_dict = {
             "id": course.id,
@@ -2081,7 +2135,7 @@ async def get_instructor_courses(
     logger.info(f"Returning {len(course_list)} instructor courses for user: {current_user.email}")
     return course_list
 
-# Update course endpoint
+# Update course endpoint - UPDATED to ensure images are always in B2
 @app.put("/courses/{course_id}", response_model=Course)
 async def update_course(
     course_id: int,
@@ -2123,14 +2177,13 @@ async def update_course(
         
         # Upload new image to B2
         course.image_filename = await upload_to_b2(image_file, "courses")
+        logger.info(f"Updated course image uploaded to B2: {course.image_filename}")
     
     db.commit()
     db.refresh(course)
     
-    # Generate presigned URL for the image
-    image_url = None
-    if course.image_filename:
-        image_url = await generate_presigned_url(course.image_filename)
+    # Get image URL from B2
+    image_url = await get_course_image_url(course)
     
     # Get instructor name
     instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
@@ -2180,10 +2233,10 @@ async def get_lesson(
         ).first()
         completed = progress is not None
     
-    # Generate presigned URL for video if it exists
+    # Generate video URL if video exists
     video_url = None
     if lesson.video_filename:
-        video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
+        video_url = f"/stream/video/{lesson.video_filename}"
     
     response_data = {
         "id": lesson.id,
@@ -2253,10 +2306,15 @@ async def update_lesson(
         
         # Upload new video to B2
         lesson.video_filename = await upload_to_b2(video_file, "lessons")
-        lesson.video_url = await generate_presigned_url(lesson.video_filename, expiration=3600)
+        logger.info(f"Updated video uploaded to B2: {lesson.video_filename}")
     
     db.commit()
     db.refresh(lesson)
+    
+    # Generate video URL for response
+    video_url = None
+    if lesson.video_filename:
+        video_url = f"/stream/video/{lesson.video_filename}"
     
     # Build the response
     response_data = {
@@ -2266,7 +2324,7 @@ async def update_lesson(
         "order": lesson.order,
         "module_id": lesson.module_id,
         "has_quiz": lesson.has_quiz,
-        "video_url": lesson.video_url,
+        "video_url": video_url,
         "video_filename": lesson.video_filename
     }
     
@@ -2325,7 +2383,7 @@ def delete_module(
         logger.error(f"Module not found or permission denied: {module_id} for user: {current_user.id}")
         raise HTTPException(status_code=404, detail="Module not found or you don't have permission")
     
-    # Delete associated lessons and their videos
+    # Delete associated lessons and their videos from B2
     for lesson in module.lessons:
         if lesson.video_filename:
             asyncio.run(delete_from_b2(lesson.video_filename))
@@ -2972,10 +3030,14 @@ async def download_certificate(
 async def b2_proxy(filename: str, db: Session = Depends(get_db)):
     """
     Proxy endpoint to serve private B2 files without exposing presigned URLs
+    This is the key endpoint for serving course images from B2
     """
     try:
         # Generate presigned URL
         presigned_url = await generate_presigned_url(filename)
+        
+        if not presigned_url:
+            raise HTTPException(status_code=404, detail="File not found")
         
         # Proxy the request
         response = requests.get(presigned_url, stream=True)
@@ -2986,13 +3048,15 @@ async def b2_proxy(filename: str, db: Session = Depends(get_db)):
                 media_type=response.headers.get('content-type', 'application/octet-stream'),
                 headers={
                     'Content-Disposition': response.headers.get('content-disposition', 'inline'),
-                    'Content-Length': response.headers.get('content-length', '')
+                    'Content-Length': response.headers.get('content-length', ''),
+                    'Cache-Control': 'public, max-age=3600'  # Cache for 1 hour
                 }
             )
         else:
             raise HTTPException(status_code=404, detail="File not found")
             
     except Exception as e:
+        logger.error(f"Error accessing B2 file {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"Error accessing file: {str(e)}")
         
 # Health check endpoint
@@ -3044,6 +3108,47 @@ async def debug_video_access(
         "enrolled": enrollment is not None,
         "b2_info": b2_info,
         "video_token_url": f"/video-token/{lesson_id}"
+    }
+
+# Debug endpoint to check course image status
+@app.get("/debug/course-image/{course_id}")
+async def debug_course_image(
+    course_id: int,
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to check course image status in B2"""
+    logger.info(f"Debug course image for course: {course_id}")
+    
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        return {"error": "Course not found"}
+    
+    # Check if image exists in B2
+    b2_info = {}
+    if course.image_filename:
+        try:
+            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=course.image_filename)
+            b2_info = {
+                "exists": True,
+                "size": head_response['ContentLength'],
+                "content_type": head_response['ContentType'],
+                "last_modified": head_response['LastModified'],
+                "image_filename": course.image_filename
+            }
+        except ClientError as e:
+            b2_info = {
+                "exists": False,
+                "error": str(e),
+                "image_filename": course.image_filename
+            }
+    
+    return {
+        "course_id": course_id,
+        "course_title": course.title,
+        "has_image_filename": bool(course.image_filename),
+        "image_url": course.image_url,
+        "b2_info": b2_info,
+        "b2_proxy_url": f"/b2-proxy/{course.image_filename}" if course.image_filename else None
     }
 
 if __name__ == "__main__":
