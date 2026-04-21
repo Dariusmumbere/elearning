@@ -75,7 +75,7 @@ except Exception as e:
 quiz_cache = {}
 
 # Database configuration (using your credentials)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://coderise_hqlk_user:Meoza9iH0JBABIGxfTNgJnvqp60wpIm4@dpg-d5fdjr0gjchc73f3pio0-a/coderise_hqlk")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://elearning_ltdb_user:FD2SwB0zrdhQjFEOPLCHXr9hytKwsaKD@dpg-d7jqsgt7vvec73dq64q0-a/elearning_ltdb")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
