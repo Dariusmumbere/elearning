@@ -13,7 +13,7 @@ import shutil
 import uuid
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response, RedirectResponse
 import boto3
 from botocore.exceptions import ClientError
 import io
@@ -251,7 +251,6 @@ class CourseCreate(CourseBase):
     pass
 
 
-# ── UPDATED: image_filename now included so the frontend can build proxy URLs ──
 class Course(CourseBase):
     id: int
     instructor_id: int
@@ -259,7 +258,7 @@ class Course(CourseBase):
     instructor_name: Optional[str] = None
     is_published: bool
     image_url: Optional[str] = None
-    image_filename: Optional[str] = None   # ← ADDED
+    image_filename: Optional[str] = None
 
     class Config:
         orm_mode = True
@@ -592,7 +591,7 @@ async def delete_from_b2(filename: str):
         raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
 
 
-async def generate_presigned_url(filename: str, expiration: int = 3600):
+async def generate_presigned_url(filename: str, expiration: int = 3600) -> Optional[str]:
     """Generate a presigned URL for a private B2 object."""
     try:
         if not filename:
@@ -610,7 +609,7 @@ async def generate_presigned_url(filename: str, expiration: int = 3600):
 
 
 async def get_course_image_url(course: CourseModel) -> Optional[str]:
-    """Return the /b2-proxy/ URL for a course image."""
+    """Return the /b2-proxy/ URL for a course image (used in API responses)."""
     if not course.image_filename:
         return None
     return f"/b2-proxy/{course.image_filename}"
@@ -949,10 +948,6 @@ def ensure_course_image_in_b2(db: Session, course_id: int):
 # ---------------------------------------------------------------------------
 
 def _build_course_response(course: CourseModel, instructor_name: str, image_url: Optional[str]) -> dict:
-    """
-    Single place that constructs the dict fed to the Course Pydantic model.
-    image_filename is always included so the frontend can build /b2-proxy/ URLs.
-    """
     return {
         "id": course.id,
         "title": course.title,
@@ -962,7 +957,7 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
         "created_at": course.created_at,
         "is_published": course.is_published,
         "image_url": image_url,
-        "image_filename": course.image_filename,   # ← always exposed
+        "image_filename": course.image_filename,
     }
 
 
@@ -2439,32 +2434,40 @@ async def upload_course_image(
 
 
 # ---------------------------------------------------------------------------
-# B2 Proxy
+# B2 Proxy  ← KEY CHANGE: redirect instead of streaming bytes
 # ---------------------------------------------------------------------------
 
 @app.get("/b2-proxy/{filename:path}")
 async def b2_proxy(filename: str):
-    """Proxy private B2 files — used for course images and other assets."""
-    try:
-        presigned_url = await generate_presigned_url(filename)
-        if not presigned_url:
-            raise HTTPException(status_code=404, detail="File not found")
+    """
+    Resolve a private B2 object to a short-lived presigned URL and issue
+    an HTTP 307 redirect.  The browser (or <img> tag) then fetches the file
+    directly from B2, bypassing the server entirely.
 
-        response = requests.get(presigned_url, stream=True)
-        if response.status_code == 200:
-            return StreamingResponse(
-                response.iter_content(chunk_size=8192),
-                media_type=response.headers.get('content-type', 'application/octet-stream'),
-                headers={
-                    'Content-Disposition': response.headers.get('content-disposition', 'inline'),
-                    'Content-Length': response.headers.get('content-length', ''),
-                    'Cache-Control': 'public, max-age=3600',
-                },
-            )
-        raise HTTPException(status_code=404, detail="File not found")
-    except Exception as e:
-        logger.error(f"Error accessing B2 file {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error accessing file: {str(e)}")
+    Why redirect instead of proxy-streaming?
+    - Streaming through the server adds latency, consumes server memory, and
+      frequently fails for large files / slow connections.
+    - A redirect is instant: one round-trip to the API, then the browser
+      fetches from B2's CDN at full speed.
+    - Presigned URLs are valid for 1 hour, so caching is safe.
+    """
+    if not filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    presigned_url = await generate_presigned_url(filename, expiration=3600)
+    if not presigned_url:
+        raise HTTPException(status_code=404, detail="File not found or could not generate URL")
+
+    # 307 Temporary Redirect — browser follows it automatically.
+    # Cache-Control is set on the redirect response so browsers don't
+    # hammer the API endpoint repeatedly for the same image.
+    return RedirectResponse(
+        url=presigned_url,
+        status_code=307,
+        headers={
+            "Cache-Control": "public, max-age=3500",  # slightly under presigned URL TTL
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2544,6 +2547,8 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
         except ClientError as e:
             b2_info = {"exists": False, "error": str(e), "image_filename": course.image_filename}
 
+    presigned_url = await generate_presigned_url(course.image_filename) if course.image_filename else None
+
     return {
         "course_id": course_id,
         "course_title": course.title,
@@ -2552,6 +2557,7 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
         "image_filename": course.image_filename,
         "b2_info": b2_info,
         "b2_proxy_url": f"/b2-proxy/{course.image_filename}" if course.image_filename else None,
+        "presigned_url_preview": presigned_url,
     }
 
 
