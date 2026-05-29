@@ -414,6 +414,12 @@ class CertificateEligibilityResponse(BaseModel):
     existing_certificate: Optional[CertificateResponse] = None
 
 
+# New: image URL response model
+class ImageUrlResponse(BaseModel):
+    url: str
+    expires_in: int  # seconds
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -608,11 +614,37 @@ async def generate_presigned_url(filename: str, expiration: int = 3600) -> Optio
         return None
 
 
+def _resolve_image_filename(course: CourseModel) -> Optional[str]:
+    """
+    Return the B2 object key for a course image, checking both
+    image_filename (preferred) and image_url (legacy).
+    """
+    if course.image_filename:
+        return course.image_filename
+    if course.image_url:
+        # Stored as a bare filename (no slashes)
+        if not course.image_url.startswith("http") and not course.image_url.startswith("/"):
+            return course.image_url
+        # Stored as /b2-proxy/<key>
+        if course.image_url.startswith("/b2-proxy/"):
+            return course.image_url[len("/b2-proxy/"):]
+        # Stored as an absolute https:// URL — extract the path component
+        if course.image_url.startswith("http"):
+            from urllib.parse import urlparse
+            path = urlparse(course.image_url).path
+            # Strip any leading slash
+            path = path.lstrip("/")
+            if path:
+                return path
+    return None
+
+
 async def get_course_image_url(course: CourseModel) -> Optional[str]:
     """Return the /b2-proxy/ URL for a course image (used in API responses)."""
-    if not course.image_filename:
+    key = _resolve_image_filename(course)
+    if not key:
         return None
-    return f"/b2-proxy/{course.image_filename}"
+    return f"/b2-proxy/{key}"
 
 
 # ---------------------------------------------------------------------------
@@ -934,15 +966,6 @@ def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
     return completed_lessons == total_lessons, completed_lessons, total_lessons, progress_percentage
 
 
-def ensure_course_image_in_b2(db: Session, course_id: int):
-    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
-    if not course:
-        return None
-    if course.image_url and not course.image_filename:
-        logger.info(f"Course {course_id} has image_url but no image_filename. Migration needed.")
-    return course.image_filename
-
-
 # ---------------------------------------------------------------------------
 # Helper: build a Course response dict consistently
 # ---------------------------------------------------------------------------
@@ -964,6 +987,80 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
 # ===========================================================================
 # Routes
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# NEW: Course Image URL endpoint
+# Returns a fresh presigned URL directly — bypasses the proxy redirect chain.
+# The frontend can use this as a second strategy if /b2-proxy/ fails.
+# ---------------------------------------------------------------------------
+
+@app.get("/courses/{course_id}/image-url", response_model=ImageUrlResponse)
+async def get_course_image_url_endpoint(
+    course_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Return a fresh presigned URL for the course image.
+    No authentication required — the presigned URL itself is the credential.
+    Expires in 3600 seconds; clients should not cache beyond that.
+    """
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    key = _resolve_image_filename(course)
+    if not key:
+        raise HTTPException(status_code=404, detail="Course has no image")
+
+    # Verify the object actually exists before generating URL
+    try:
+        b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=key)
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        logger.warning(f"Image key '{key}' not found in B2: {error_code}")
+        raise HTTPException(status_code=404, detail="Image file not found in storage")
+
+    presigned_url = await generate_presigned_url(key, expiration=3600)
+    if not presigned_url:
+        raise HTTPException(status_code=500, detail="Could not generate image URL")
+
+    return {"url": presigned_url, "expires_in": 3600}
+
+
+# ---------------------------------------------------------------------------
+# NEW: Batch image URLs — fetch presigned URLs for multiple courses at once.
+# Reduces N round-trips on the course listing page to 1.
+# ---------------------------------------------------------------------------
+
+@app.post("/courses/image-urls")
+async def get_bulk_course_image_urls(
+    course_ids: List[int],
+    db: Session = Depends(get_db),
+):
+    """
+    Body: [1, 2, 3, ...]
+    Returns: {"1": "https://...", "2": "https://...", ...}
+    Missing or errored courses are omitted from the response.
+    """
+    result = {}
+    courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
+
+    for course in courses:
+        key = _resolve_image_filename(course)
+        if not key:
+            continue
+        try:
+            b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=key)
+            url = await generate_presigned_url(key, expiration=3600)
+            if url:
+                result[str(course.id)] = url
+        except ClientError:
+            logger.warning(f"Bulk image: key '{key}' not found for course {course.id}")
+        except Exception as e:
+            logger.error(f"Bulk image error for course {course.id}: {e}")
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Video Streaming
@@ -2434,38 +2531,53 @@ async def upload_course_image(
 
 
 # ---------------------------------------------------------------------------
-# B2 Proxy  ← KEY CHANGE: redirect instead of streaming bytes
+# B2 Proxy — 307 redirect to a fresh presigned URL
 # ---------------------------------------------------------------------------
 
 @app.get("/b2-proxy/{filename:path}")
-async def b2_proxy(filename: str):
+async def b2_proxy(filename: str, request: Request):
     """
     Resolve a private B2 object to a short-lived presigned URL and issue
-    an HTTP 307 redirect.  The browser (or <img> tag) then fetches the file
-    directly from B2, bypassing the server entirely.
+    an HTTP 307 redirect.
 
-    Why redirect instead of proxy-streaming?
-    - Streaming through the server adds latency, consumes server memory, and
-      frequently fails for large files / slow connections.
-    - A redirect is instant: one round-trip to the API, then the browser
-      fetches from B2's CDN at full speed.
-    - Presigned URLs are valid for 1 hour, so caching is safe.
+    Improvements over the original:
+    - Verifies the object exists (HEAD) before generating the URL, so we
+      can return a clean 404 instead of a broken redirect.
+    - Returns CORS headers so browsers on different origins don't block the
+      redirect follow-through.
+    - Strips query-string noise (e.g. ?t=cache-bust) before looking up the key.
     """
     if not filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 
-    presigned_url = await generate_presigned_url(filename, expiration=3600)
-    if not presigned_url:
-        raise HTTPException(status_code=404, detail="File not found or could not generate URL")
+    # Strip any accidental query params that crept into the path segment
+    clean_filename = filename.split("?")[0].strip("/")
+    if not clean_filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
 
-    # 307 Temporary Redirect — browser follows it automatically.
-    # Cache-Control is set on the redirect response so browsers don't
-    # hammer the API endpoint repeatedly for the same image.
+    # Verify existence first to give a meaningful 404 rather than a broken redirect
+    try:
+        b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=clean_filename)
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code in ("404", "NoSuchKey"):
+            logger.warning(f"B2 proxy: object not found: {clean_filename}")
+            raise HTTPException(status_code=404, detail="File not found")
+        # Other errors (permissions, network) — still try to generate the URL
+        logger.warning(f"B2 HEAD warning for '{clean_filename}': {error_code}")
+
+    presigned_url = await generate_presigned_url(clean_filename, expiration=3600)
+    if not presigned_url:
+        raise HTTPException(status_code=500, detail="Could not generate file URL")
+
+    origin = request.headers.get("origin", "*")
     return RedirectResponse(
         url=presigned_url,
         status_code=307,
         headers={
-            "Cache-Control": "public, max-age=3500",  # slightly under presigned URL TTL
+            "Cache-Control": "public, max-age=3500",
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
         },
     )
 
@@ -2533,30 +2645,34 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
     if not course:
         return {"error": "Course not found"}
 
+    resolved_key = _resolve_image_filename(course)
+
     b2_info = {}
-    if course.image_filename:
+    if resolved_key:
         try:
-            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=course.image_filename)
+            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=resolved_key)
             b2_info = {
                 "exists": True,
                 "size": head_response['ContentLength'],
                 "content_type": head_response['ContentType'],
                 "last_modified": head_response['LastModified'],
-                "image_filename": course.image_filename,
+                "resolved_key": resolved_key,
             }
         except ClientError as e:
-            b2_info = {"exists": False, "error": str(e), "image_filename": course.image_filename}
+            b2_info = {"exists": False, "error": str(e), "resolved_key": resolved_key}
 
-    presigned_url = await generate_presigned_url(course.image_filename) if course.image_filename else None
+    presigned_url = await generate_presigned_url(resolved_key) if resolved_key else None
 
     return {
         "course_id": course_id,
         "course_title": course.title,
         "has_image_filename": bool(course.image_filename),
-        "image_url": course.image_url,
-        "image_filename": course.image_filename,
+        "image_url_raw": course.image_url,
+        "image_filename_raw": course.image_filename,
+        "resolved_key": resolved_key,
         "b2_info": b2_info,
-        "b2_proxy_url": f"/b2-proxy/{course.image_filename}" if course.image_filename else None,
+        "b2_proxy_url": f"/b2-proxy/{resolved_key}" if resolved_key else None,
+        "direct_image_url_endpoint": f"/courses/{course_id}/image-url",
         "presigned_url_preview": presigned_url,
     }
 
