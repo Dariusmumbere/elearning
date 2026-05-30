@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func, Float, Numeric
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr, validator
@@ -82,6 +82,36 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ---------------------------------------------------------------------------
+# PesaPal Configuration
+# ---------------------------------------------------------------------------
+
+# Sandbox credentials — replace with production values when going live.
+# Download test credentials from: https://developer.pesapal.com/api3-demo-keys.txt
+PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "lGw3V7l9BwOqZKttLM3Z8KcmopU1+tT1")
+PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCYFjn0y5n9xEs=")
+
+# Toggle between sandbox and production:
+#   PESAPAL_ENV=sandbox  → https://cybqa.pesapal.com/pesapalv3
+#   PESAPAL_ENV=production → https://pay.pesapal.com/v3
+PESAPAL_ENV = os.getenv("PESAPAL_ENV", "sandbox")
+
+PESAPAL_BASE_URLS = {
+    "sandbox": "https://cybqa.pesapal.com/pesapalv3",
+    "production": "https://pay.pesapal.com/v3",
+}
+PESAPAL_BASE_URL = PESAPAL_BASE_URLS.get(PESAPAL_ENV, PESAPAL_BASE_URLS["sandbox"])
+
+# IPN notification ID — obtained by calling /payments/register-ipn (stored in env after first registration)
+PESAPAL_IPN_ID = os.getenv("PESAPAL_IPN_ID", "")
+
+# The public base URL of this API (used for callback / IPN URLs)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://elearning-1-r5di.onrender.com")
+
+# Default course price when none is set
+DEFAULT_COURSE_PRICE = float(os.getenv("DEFAULT_COURSE_PRICE", "10.00"))
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "KES")
+
+# ---------------------------------------------------------------------------
 # Database Models
 # ---------------------------------------------------------------------------
 
@@ -100,6 +130,7 @@ class UserModel(Base):
     enrollments = relationship("EnrollmentModel", back_populates="user")
     quiz_attempts = relationship("QuizAttemptModel", back_populates="user")
     certificates = relationship("CertificateModel", back_populates="user")
+    payment_orders = relationship("PaymentOrderModel", back_populates="user")
 
 
 class CourseModel(Base):
@@ -113,11 +144,14 @@ class CourseModel(Base):
     is_published = Column(Boolean, default=False)
     image_url = Column(String, nullable=True)
     image_filename = Column(String, nullable=True)
+    price = Column(Float, nullable=True, default=None)       # None = free
+    currency = Column(String, nullable=True, default="KES")
 
     instructor = relationship("UserModel", back_populates="courses")
     modules = relationship("ModuleModel", back_populates="course")
     enrollments = relationship("EnrollmentModel", back_populates="course")
     certificates = relationship("CertificateModel", back_populates="course")
+    payment_orders = relationship("PaymentOrderModel", back_populates="course")
 
 
 class ModuleModel(Base):
@@ -206,6 +240,39 @@ class CertificateModel(Base):
     course = relationship("CourseModel", back_populates="certificates")
 
 
+class PaymentOrderModel(Base):
+    """Tracks PesaPal payment orders for course enrollments."""
+    __tablename__ = "payment_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    course_id = Column(Integer, ForeignKey("courses.id"))
+
+    # Our unique reference sent to PesaPal (merchant_reference)
+    merchant_reference = Column(String, unique=True, index=True)
+
+    # PesaPal's tracking ID returned after SubmitOrderRequest
+    order_tracking_id = Column(String, nullable=True, index=True)
+
+    amount = Column(Float)
+    currency = Column(String, default="KES")
+
+    # Payment status: PENDING | COMPLETED | FAILED | CANCELLED | REVERSED | INVALID
+    status = Column(String, default="PENDING")
+
+    # Raw details returned by GetTransactionStatus
+    payment_method = Column(String, nullable=True)
+    confirmation_code = Column(String, nullable=True)
+    payment_account = Column(String, nullable=True)
+    payment_status_description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("UserModel", back_populates="payment_orders")
+    course = relationship("CourseModel", back_populates="payment_orders")
+
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
@@ -259,6 +326,9 @@ class Course(CourseBase):
     is_published: bool
     image_url: Optional[str] = None
     image_filename: Optional[str] = None
+    price: Optional[float] = None
+    currency: Optional[str] = "KES"
+    is_free: Optional[bool] = True
 
     class Config:
         orm_mode = True
@@ -421,6 +491,69 @@ class ImageUrlResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Payment Pydantic Models
+# ---------------------------------------------------------------------------
+
+class PaymentInitiateRequest(BaseModel):
+    course_id: int
+    callback_url: Optional[str] = None   # frontend URL to redirect after payment
+    cancellation_url: Optional[str] = None
+
+
+class PaymentOrderResponse(BaseModel):
+    id: int
+    user_id: int
+    course_id: int
+    merchant_reference: str
+    order_tracking_id: Optional[str]
+    amount: float
+    currency: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    course_title: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
+class PaymentInitiateResponse(BaseModel):
+    merchant_reference: str
+    order_tracking_id: str
+    redirect_url: str
+    amount: float
+    currency: str
+
+
+class PaymentStatusResponse(BaseModel):
+    merchant_reference: str
+    order_tracking_id: Optional[str]
+    status: str
+    payment_method: Optional[str]
+    confirmation_code: Optional[str]
+    amount: float
+    currency: str
+    course_id: int
+    enrolled: bool
+    message: Optional[str]
+
+
+class IPNRegisterRequest(BaseModel):
+    ipn_url: Optional[str] = None  # if omitted, auto-built from API_BASE_URL
+
+
+class IPNRegisterResponse(BaseModel):
+    ipn_id: str
+    url: str
+    message: str
+
+
+class CoursePriceUpdate(BaseModel):
+    price: Optional[float] = None   # None = free
+    currency: Optional[str] = "KES"
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -470,7 +603,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://online-yze5-myir9uasl-dariusmumberes-projects.vercel.app",
         "https://online-coderise.vercel.app",
-        "https://elearning-1-fyf2.onrender.com",
+        "https://elearning-1-r5di.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -615,10 +748,6 @@ async def generate_presigned_url(filename: str, expiration: int = 3600) -> Optio
 
 
 def _resolve_image_filename(course: CourseModel) -> Optional[str]:
-    """
-    Return the B2 object key for a course image, checking both
-    image_filename (preferred) and image_url (legacy).
-    """
     if course.image_filename:
         return course.image_filename
     if course.image_url:
@@ -636,7 +765,6 @@ def _resolve_image_filename(course: CourseModel) -> Optional[str]:
 
 
 async def get_course_image_url(course: CourseModel) -> Optional[str]:
-    """Return the /b2-proxy/ URL for a course image (used in API responses)."""
     key = _resolve_image_filename(course)
     if not key:
         return None
@@ -962,10 +1090,6 @@ def check_course_completion(db: Session, user_id: int, course_id: int) -> tuple:
     return completed_lessons == total_lessons, completed_lessons, total_lessons, progress_percentage
 
 
-# ---------------------------------------------------------------------------
-# Helper: build a Course response dict consistently
-# ---------------------------------------------------------------------------
-
 def _build_course_response(course: CourseModel, instructor_name: str, image_url: Optional[str]) -> dict:
     return {
         "id": course.id,
@@ -977,7 +1101,219 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
         "is_published": course.is_published,
         "image_url": image_url,
         "image_filename": course.image_filename,
+        "price": course.price,
+        "currency": course.currency or "KES",
+        "is_free": course.price is None or course.price == 0,
     }
+
+
+# ===========================================================================
+# PesaPal Service Layer
+# ===========================================================================
+
+class PesapalService:
+    """
+    Encapsulates all PesaPal API 3.0 calls.
+
+    Token caching: tokens are valid for 5 minutes; we cache one in memory
+    and refresh automatically before each request.
+    """
+
+    _token: Optional[str] = None
+    _token_expiry: Optional[datetime] = None
+
+    @classmethod
+    def _pesapal_headers(cls, token: str) -> dict:
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+    @classmethod
+    async def get_token(cls) -> str:
+        """Fetch / return a cached bearer token."""
+        now = datetime.utcnow()
+        # Refresh if missing or within 30 seconds of expiry
+        if cls._token and cls._token_expiry and (cls._token_expiry - now).total_seconds() > 30:
+            return cls._token
+
+        url = f"{PESAPAL_BASE_URL}/api/Auth/RequestToken"
+        payload = {
+            "consumer_key": PESAPAL_CONSUMER_KEY,
+            "consumer_secret": PESAPAL_CONSUMER_SECRET,
+        }
+        try:
+            resp = requests.post(url, json=payload, headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "200" or not data.get("token"):
+                raise HTTPException(status_code=502, detail=f"PesaPal auth failed: {data.get('message')}")
+            cls._token = data["token"]
+            # expiryDate is UTC — parse it
+            expiry_str = data.get("expiryDate", "")
+            try:
+                cls._token_expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                cls._token_expiry = datetime.utcnow() + timedelta(minutes=4, seconds=30)
+            logger.info("PesaPal token refreshed successfully")
+            return cls._token
+        except requests.RequestException as e:
+            logger.error(f"PesaPal auth request error: {e}")
+            raise HTTPException(status_code=502, detail="Could not connect to PesaPal")
+
+    @classmethod
+    async def register_ipn(cls, ipn_url: str) -> dict:
+        """Register an IPN URL and return its ID."""
+        token = await cls.get_token()
+        url = f"{PESAPAL_BASE_URL}/api/URLSetup/RegisterIPN"
+        payload = {
+            "url": ipn_url,
+            "ipn_notification_type": "GET",
+        }
+        try:
+            resp = requests.post(url, json=payload, headers=cls._pesapal_headers(token), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(f"PesaPal IPN registered: {data}")
+            return data
+        except requests.RequestException as e:
+            logger.error(f"PesaPal register IPN error: {e}")
+            raise HTTPException(status_code=502, detail="Could not register IPN URL with PesaPal")
+
+    @classmethod
+    async def get_ipn_list(cls) -> list:
+        """Return all registered IPN URLs."""
+        token = await cls.get_token()
+        url = f"{PESAPAL_BASE_URL}/api/URLSetup/GetIpnList"
+        try:
+            resp = requests.get(url, headers=cls._pesapal_headers(token), timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error(f"PesaPal get IPN list error: {e}")
+            raise HTTPException(status_code=502, detail="Could not fetch IPN list from PesaPal")
+
+    @classmethod
+    async def submit_order(
+        cls,
+        merchant_reference: str,
+        amount: float,
+        currency: str,
+        description: str,
+        callback_url: str,
+        cancellation_url: Optional[str],
+        notification_id: str,
+        user: UserModel,
+    ) -> dict:
+        """Submit a payment order to PesaPal and return the redirect URL."""
+        token = await cls.get_token()
+        url = f"{PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest"
+
+        # Split full_name into first / last
+        name_parts = (user.full_name or "").split(" ", 1)
+        first_name = name_parts[0] if name_parts else ""
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        payload = {
+            "id": merchant_reference,
+            "currency": currency,
+            "amount": round(amount, 2),
+            "description": description[:100],
+            "callback_url": callback_url,
+            "notification_id": notification_id,
+            "billing_address": {
+                "email_address": user.email,
+                "phone_number": "",
+                "country_code": "UG",
+                "first_name": first_name,
+                "middle_name": "",
+                "last_name": last_name,
+                "line_1": "",
+                "line_2": "",
+                "city": "",
+                "state": "",
+                "postal_code": "",
+                "zip_code": "",
+            },
+        }
+        if cancellation_url:
+            payload["cancellation_url"] = cancellation_url
+
+        try:
+            resp = requests.post(url, json=payload, headers=cls._pesapal_headers(token), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(f"PesaPal submit order response: {data}")
+            if data.get("status") != "200":
+                raise HTTPException(status_code=502, detail=f"PesaPal order submission failed: {data.get('message')}")
+            return data
+        except requests.RequestException as e:
+            logger.error(f"PesaPal submit order error: {e}")
+            raise HTTPException(status_code=502, detail="Could not submit order to PesaPal")
+
+    @classmethod
+    async def get_transaction_status(cls, order_tracking_id: str) -> dict:
+        """Fetch the current status of a transaction from PesaPal."""
+        token = await cls.get_token()
+        url = f"{PESAPAL_BASE_URL}/api/Transactions/GetTransactionStatus?orderTrackingId={order_tracking_id}"
+        try:
+            resp = requests.get(url, headers=cls._pesapal_headers(token), timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(f"PesaPal transaction status for {order_tracking_id}: {data}")
+            return data
+        except requests.RequestException as e:
+            logger.error(f"PesaPal get transaction status error: {e}")
+            raise HTTPException(status_code=502, detail="Could not fetch transaction status from PesaPal")
+
+
+# ---------------------------------------------------------------------------
+# Payment helper — resolve / validate notification_id
+# ---------------------------------------------------------------------------
+
+async def _get_or_register_ipn_id(db_ipn_id: str = "") -> str:
+    """
+    Return the configured IPN ID.
+    If PESAPAL_IPN_ID env var is set, use it.
+    Otherwise, attempt to auto-register and return the first one found.
+    Raises HTTPException if none is available.
+    """
+    global PESAPAL_IPN_ID
+
+    if PESAPAL_IPN_ID:
+        return PESAPAL_IPN_ID
+
+    # Try to fetch existing IPN list
+    try:
+        ipn_list = await PesapalService.get_ipn_list()
+        if ipn_list and isinstance(ipn_list, list) and len(ipn_list) > 0:
+            PESAPAL_IPN_ID = ipn_list[0].get("ipn_id", "")
+            if PESAPAL_IPN_ID:
+                logger.info(f"Using existing PesaPal IPN ID: {PESAPAL_IPN_ID}")
+                return PESAPAL_IPN_ID
+    except Exception:
+        pass
+
+    # Auto-register with the default IPN URL
+    ipn_url = f"{API_BASE_URL}/payments/ipn"
+    try:
+        data = await PesapalService.register_ipn(ipn_url)
+        PESAPAL_IPN_ID = data.get("ipn_id", "")
+        if PESAPAL_IPN_ID:
+            logger.info(f"Auto-registered PesaPal IPN ID: {PESAPAL_IPN_ID}")
+            return PESAPAL_IPN_ID
+    except Exception as e:
+        logger.error(f"Failed to auto-register IPN: {e}")
+
+    raise HTTPException(
+        status_code=500,
+        detail="PesaPal IPN ID not configured. Call POST /payments/register-ipn first, "
+               "then set PESAPAL_IPN_ID env var.",
+    )
 
 
 # ===========================================================================
@@ -1041,13 +1377,9 @@ async def get_bulk_course_image_urls(
 
 
 # ---------------------------------------------------------------------------
-# Video Streaming  ← KEY FIX AREA
+# Video Streaming
 # ---------------------------------------------------------------------------
 
-# Chunk size tuned for streaming:
-# - 512 KB is large enough to reduce round-trips to B2
-# - Small enough that the first chunk reaches the browser quickly,
-#   allowing it to start decoding and eliminate the stall
 _VIDEO_CHUNK_SIZE = 512 * 1024  # 512 KB
 
 
@@ -1060,7 +1392,6 @@ async def stream_video(
 ):
     logger.info(f"Video streaming request for filename: {filename}")
 
-    # ── 1. Validate JWT ───────────────────────────────────────────────────
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError as e:
@@ -1072,7 +1403,6 @@ async def stream_video(
     if not user_id or not lesson_id:
         raise HTTPException(status_code=401, detail="Invalid video token payload")
 
-    # ── 2. Auth checks ───────────────────────────────────────────────────
     user = db.query(UserModel).filter(UserModel.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -1094,7 +1424,6 @@ async def stream_video(
     object_key = lesson.video_filename
     logger.info(f"Streaming object key: {object_key}")
 
-    # ── 3. HEAD — confirm existence and get metadata ──────────────────────
     try:
         head = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=object_key)
         file_size = head["ContentLength"]
@@ -1104,7 +1433,6 @@ async def stream_video(
         logger.error(f"B2 HEAD error: {e}")
         raise HTTPException(status_code=404, detail="Video file not found in storage")
 
-    # ── 4. Parse Range header ────────────────────────────────────────────
     range_header = request.headers.get("Range")
     get_kwargs: dict = {"Bucket": B2_BUCKET_NAME, "Key": object_key}
     status_code = 200
@@ -1127,7 +1455,6 @@ async def stream_video(
             content_range = f"bytes {start}-{end}/{file_size}"
             logger.info(f"Range request: {get_kwargs['Range']} ({content_length} bytes)")
         except (ValueError, AttributeError):
-            # Malformed Range — serve full file
             range_header = None
 
     if not range_header:
@@ -1135,18 +1462,12 @@ async def stream_video(
         end = file_size - 1
         content_length = file_size
 
-    # ── 5. Fetch from B2 ─────────────────────────────────────────────────
     try:
         b2_response = b2_client.get_object(**get_kwargs)
     except ClientError as e:
         logger.error(f"B2 GET error: {e}")
         raise HTTPException(status_code=502, detail="Storage fetch error")
 
-    # ── 6. Stream body ───────────────────────────────────────────────────
-    # IMPORTANT: This generator yields bytes directly from B2's response
-    # body without any buffering layer.  Each chunk is forwarded to the
-    # client as soon as it is received from B2, keeping the TCP window
-    # open and preventing Render's proxy from timing out on idle connections.
     def _stream_video_chunks(body):
         bytes_sent = 0
         try:
@@ -1161,20 +1482,15 @@ async def stream_video(
             logger.error(
                 f"Stream error for '{object_key}' after {bytes_sent} bytes: {exc}"
             )
-            # Generator return — client will see a truncated response and
-            # fire an error event, which triggers the frontend retry logic.
 
     headers = {
-        # CORS — needed because the video src is a cross-origin URL
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Range, Content-Type",
         "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
-        # Caching & range support
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Type": content_type,
-        # Tell CDNs/proxies not to buffer — ensures first-byte latency stays low
         "X-Accel-Buffering": "no",
         "Cache-Control": "public, max-age=3600",
     }
@@ -1631,6 +1947,8 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 async def create_course(
     title: str = Form(...),
     description: str = Form(None),
+    price: Optional[float] = Form(None),
+    currency: Optional[str] = Form("KES"),
     image_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1655,6 +1973,8 @@ async def create_course(
         description=description,
         instructor_id=current_user.id,
         image_filename=image_filename,
+        price=price,
+        currency=currency or "KES",
     )
     db.add(db_course)
     db.commit()
@@ -1698,6 +2018,8 @@ async def update_course(
     course_id: int,
     title: str = Form(None),
     description: str = Form(None),
+    price: Optional[float] = Form(None),
+    currency: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1716,6 +2038,10 @@ async def update_course(
         course.title = title
     if description is not None:
         course.description = description
+    if price is not None:
+        course.price = price
+    if currency is not None:
+        course.currency = currency
 
     if image_file:
         allowed_image_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
@@ -1737,6 +2063,37 @@ async def update_course(
     instructor_name = instructor.full_name if instructor else "Unknown Instructor"
     logger.info(f"Course updated successfully: {course_id}")
     return _build_course_response(course, instructor_name, image_url)
+
+
+@app.patch("/courses/{course_id}/price")
+async def update_course_price(
+    course_id: int,
+    price_data: CoursePriceUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set or update the price of a course (instructors only). Set price to null/0 to make it free."""
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can update course prices")
+
+    course = db.query(CourseModel).filter(
+        CourseModel.id == course_id, CourseModel.instructor_id == current_user.id
+    ).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found or permission denied")
+
+    course.price = price_data.price if price_data.price and price_data.price > 0 else None
+    course.currency = price_data.currency or "KES"
+    db.commit()
+    db.refresh(course)
+
+    return {
+        "course_id": course.id,
+        "price": course.price,
+        "currency": course.currency,
+        "is_free": course.price is None or course.price == 0,
+        "message": "Course price updated successfully",
+    }
 
 
 @app.put("/courses/{course_id}/publish/")
@@ -2028,9 +2385,22 @@ def enroll_in_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    Enroll in a free course directly.
+    For paid courses, use POST /payments/initiate instead — enrollment
+    happens automatically after successful payment.
+    """
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
+
+    # Block direct enrollment for paid courses
+    if course.price and course.price > 0:
+        raise HTTPException(
+            status_code=402,
+            detail="This is a paid course. Please complete payment via POST /payments/initiate to enroll.",
+        )
+
     existing_enrollment = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id,
         EnrollmentModel.course_id == course_id,
@@ -2514,10 +2884,6 @@ async def upload_course_image(
 
 @app.get("/b2-proxy/{filename:path}")
 async def b2_proxy(filename: str, request: Request):
-    """
-    Streaming proxy: fetches the object from B2 server-side and pipes bytes
-    directly to the browser, adding correct CORS headers.
-    """
     if not filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 
@@ -2619,6 +2985,509 @@ async def b2_proxy_options(filename: str):
     )
 
 
+# ===========================================================================
+# PesaPal Payment Routes
+# ===========================================================================
+
+@app.post("/payments/register-ipn", response_model=IPNRegisterResponse)
+async def register_ipn_url(
+    body: IPNRegisterRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Register an IPN (Instant Payment Notification) URL with PesaPal.
+
+    You only need to call this once. Store the returned ipn_id in the
+    PESAPAL_IPN_ID environment variable so subsequent payment requests
+    use it automatically.
+
+    Any authenticated user can call this (instructors typically do so
+    during platform setup).
+    """
+    ipn_url = body.ipn_url or f"{API_BASE_URL}/payments/ipn"
+    data = await PesapalService.register_ipn(ipn_url)
+    ipn_id = data.get("ipn_id", "")
+    return IPNRegisterResponse(
+        ipn_id=ipn_id,
+        url=ipn_url,
+        message=f"IPN registered. Set PESAPAL_IPN_ID={ipn_id} in your environment variables.",
+    )
+
+
+@app.get("/payments/ipn-list")
+async def list_ipn_urls(current_user: User = Depends(get_current_user)):
+    """Return all IPN URLs registered with PesaPal for this merchant account."""
+    return await PesapalService.get_ipn_list()
+
+
+@app.post("/payments/initiate", response_model=PaymentInitiateResponse)
+async def initiate_payment(
+    body: PaymentInitiateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiate a PesaPal payment for a course.
+
+    Returns a redirect_url — send the user to this URL (or embed it as
+    an iframe) to complete payment. Once payment is confirmed PesaPal
+    will call your IPN endpoint and redirect the user to callback_url.
+
+    Flow:
+      1. Client calls POST /payments/initiate
+      2. API creates a PaymentOrder record (status=PENDING)
+      3. API calls PesaPal SubmitOrderRequest → gets redirect_url
+      4. Client redirects user to redirect_url
+      5. User pays on PesaPal
+      6. PesaPal hits GET /payments/ipn?OrderTrackingId=...
+      7. API verifies status → if COMPLETED, auto-enrols user
+      8. PesaPal redirects user to callback_url (frontend handles display)
+    """
+    course = db.query(CourseModel).filter(CourseModel.id == body.course_id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    if not course.price or course.price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="This course is free. Use POST /enroll/{course_id} instead.",
+        )
+
+    # Already enrolled?
+    existing_enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == body.course_id,
+    ).first()
+    if existing_enrollment:
+        raise HTTPException(status_code=400, detail="You are already enrolled in this course.")
+
+    # Already have a completed payment?
+    completed_payment = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.user_id == current_user.id,
+        PaymentOrderModel.course_id == body.course_id,
+        PaymentOrderModel.status == "COMPLETED",
+    ).first()
+    if completed_payment:
+        raise HTTPException(status_code=400, detail="Payment already completed for this course.")
+
+    # Build our unique merchant reference (alphanumeric + dashes, max 50 chars)
+    merchant_reference = f"CRS-{body.course_id}-USR-{current_user.id}-{uuid.uuid4().hex[:8].upper()}"
+
+    # Callback and cancellation URLs
+    callback_url = body.callback_url or f"{API_BASE_URL}/payments/callback"
+    cancellation_url = body.cancellation_url or f"{API_BASE_URL}/payments/cancelled"
+
+    notification_id = await _get_or_register_ipn_id()
+
+    # Create a PENDING order in the DB before calling PesaPal
+    payment_order = PaymentOrderModel(
+        user_id=current_user.id,
+        course_id=body.course_id,
+        merchant_reference=merchant_reference,
+        amount=course.price,
+        currency=course.currency or DEFAULT_CURRENCY,
+        status="PENDING",
+    )
+    db.add(payment_order)
+    db.commit()
+    db.refresh(payment_order)
+
+    # Submit to PesaPal
+    try:
+        user_obj = db.query(UserModel).filter(UserModel.id == current_user.id).first()
+        pesapal_response = await PesapalService.submit_order(
+            merchant_reference=merchant_reference,
+            amount=course.price,
+            currency=course.currency or DEFAULT_CURRENCY,
+            description=f"Enrolment: {course.title[:80]}",
+            callback_url=callback_url,
+            cancellation_url=cancellation_url,
+            notification_id=notification_id,
+            user=user_obj,
+        )
+    except HTTPException:
+        # Mark as failed if PesaPal call fails
+        payment_order.status = "FAILED"
+        db.commit()
+        raise
+
+    # Update the order with PesaPal's tracking ID
+    payment_order.order_tracking_id = pesapal_response.get("order_tracking_id", "")
+    db.commit()
+
+    logger.info(
+        f"Payment initiated: merchant_ref={merchant_reference} "
+        f"tracking={payment_order.order_tracking_id} "
+        f"amount={course.price} {course.currency}"
+    )
+
+    return PaymentInitiateResponse(
+        merchant_reference=merchant_reference,
+        order_tracking_id=payment_order.order_tracking_id,
+        redirect_url=pesapal_response["redirect_url"],
+        amount=course.price,
+        currency=course.currency or DEFAULT_CURRENCY,
+    )
+
+
+@app.get("/payments/ipn")
+async def pesapal_ipn(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    PesaPal IPN (Instant Payment Notification) endpoint — GET method.
+
+    PesaPal calls this URL whenever a payment status changes.
+    We verify the status and enrol the user if payment is COMPLETED.
+
+    PesaPal expects a JSON response:
+      {"orderNotificationType":"IPNCHANGE","orderTrackingId":"...","orderMerchantReference":"...","status":200}
+    """
+    params = dict(request.query_params)
+    order_tracking_id = params.get("OrderTrackingId", "")
+    merchant_reference = params.get("OrderMerchantReference", "")
+    notification_type = params.get("OrderNotificationType", "")
+
+    logger.info(
+        f"PesaPal IPN received: tracking={order_tracking_id} "
+        f"ref={merchant_reference} type={notification_type}"
+    )
+
+    if not order_tracking_id:
+        return JSONResponse(
+            content={"orderNotificationType": notification_type, "orderTrackingId": "",
+                     "orderMerchantReference": merchant_reference, "status": 500}
+        )
+
+    # Fetch transaction status from PesaPal
+    try:
+        tx = await PesapalService.get_transaction_status(order_tracking_id)
+    except Exception as e:
+        logger.error(f"IPN: failed to get transaction status: {e}")
+        return JSONResponse(
+            content={"orderNotificationType": notification_type, "orderTrackingId": order_tracking_id,
+                     "orderMerchantReference": merchant_reference, "status": 500}
+        )
+
+    # Map PesaPal status_code → our internal status string
+    status_map = {0: "INVALID", 1: "COMPLETED", 2: "FAILED", 3: "REVERSED"}
+    internal_status = status_map.get(tx.get("status_code"), "PENDING")
+    payment_status_description = tx.get("payment_status_description", "")
+
+    # Find our order record
+    payment_order = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.order_tracking_id == order_tracking_id
+    ).first()
+
+    if not payment_order:
+        # Try matching by merchant_reference as fallback
+        payment_order = db.query(PaymentOrderModel).filter(
+            PaymentOrderModel.merchant_reference == merchant_reference
+        ).first()
+
+    if not payment_order:
+        logger.warning(f"IPN: no payment order found for tracking={order_tracking_id}")
+        return JSONResponse(
+            content={"orderNotificationType": notification_type, "orderTrackingId": order_tracking_id,
+                     "orderMerchantReference": merchant_reference, "status": 200}
+        )
+
+    # Update the order with payment details
+    payment_order.status = internal_status
+    payment_order.payment_method = tx.get("payment_method")
+    payment_order.confirmation_code = tx.get("confirmation_code")
+    payment_order.payment_account = tx.get("payment_account")
+    payment_order.payment_status_description = payment_status_description
+    payment_order.updated_at = datetime.utcnow()
+    db.commit()
+
+    # Auto-enrol user on COMPLETED payment
+    if internal_status == "COMPLETED":
+        existing_enrollment = db.query(EnrollmentModel).filter(
+            EnrollmentModel.user_id == payment_order.user_id,
+            EnrollmentModel.course_id == payment_order.course_id,
+        ).first()
+        if not existing_enrollment:
+            enrollment = EnrollmentModel(
+                user_id=payment_order.user_id,
+                course_id=payment_order.course_id,
+            )
+            db.add(enrollment)
+            db.commit()
+            logger.info(
+                f"User {payment_order.user_id} auto-enrolled in course {payment_order.course_id} "
+                f"after successful payment (ref={merchant_reference})"
+            )
+
+    logger.info(f"IPN processed: ref={merchant_reference} status={internal_status}")
+
+    return JSONResponse(
+        content={
+            "orderNotificationType": notification_type,
+            "orderTrackingId": order_tracking_id,
+            "orderMerchantReference": merchant_reference,
+            "status": 200,
+        }
+    )
+
+
+@app.post("/payments/ipn")
+async def pesapal_ipn_post(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Handle POST-style IPN calls (PesaPal supports both GET and POST)."""
+    try:
+        body = await request.json()
+        order_tracking_id = body.get("OrderTrackingId", "")
+        merchant_reference = body.get("OrderMerchantReference", "")
+        notification_type = body.get("OrderNotificationType", "IPNCHANGE")
+    except Exception:
+        body = dict(await request.form())
+        order_tracking_id = body.get("OrderTrackingId", "")
+        merchant_reference = body.get("OrderMerchantReference", "")
+        notification_type = body.get("OrderNotificationType", "IPNCHANGE")
+
+    # Re-use the GET handler logic by building a fake request params string
+    # and delegating to the same processing code
+    logger.info(f"PesaPal POST IPN: tracking={order_tracking_id} ref={merchant_reference}")
+
+    if not order_tracking_id:
+        return JSONResponse(
+            content={"orderNotificationType": notification_type, "orderTrackingId": "",
+                     "orderMerchantReference": merchant_reference, "status": 500}
+        )
+
+    try:
+        tx = await PesapalService.get_transaction_status(order_tracking_id)
+    except Exception as e:
+        logger.error(f"POST IPN: failed to get transaction status: {e}")
+        return JSONResponse(
+            content={"orderNotificationType": notification_type, "orderTrackingId": order_tracking_id,
+                     "orderMerchantReference": merchant_reference, "status": 500}
+        )
+
+    status_map = {0: "INVALID", 1: "COMPLETED", 2: "FAILED", 3: "REVERSED"}
+    internal_status = status_map.get(tx.get("status_code"), "PENDING")
+
+    payment_order = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.order_tracking_id == order_tracking_id
+    ).first() or db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.merchant_reference == merchant_reference
+    ).first()
+
+    if payment_order:
+        payment_order.status = internal_status
+        payment_order.payment_method = tx.get("payment_method")
+        payment_order.confirmation_code = tx.get("confirmation_code")
+        payment_order.payment_account = tx.get("payment_account")
+        payment_order.payment_status_description = tx.get("payment_status_description")
+        payment_order.updated_at = datetime.utcnow()
+        db.commit()
+
+        if internal_status == "COMPLETED":
+            existing_enrollment = db.query(EnrollmentModel).filter(
+                EnrollmentModel.user_id == payment_order.user_id,
+                EnrollmentModel.course_id == payment_order.course_id,
+            ).first()
+            if not existing_enrollment:
+                db.add(EnrollmentModel(
+                    user_id=payment_order.user_id,
+                    course_id=payment_order.course_id,
+                ))
+                db.commit()
+                logger.info(f"User {payment_order.user_id} enrolled after POST IPN (COMPLETED)")
+
+    return JSONResponse(
+        content={"orderNotificationType": notification_type, "orderTrackingId": order_tracking_id,
+                 "orderMerchantReference": merchant_reference, "status": 200}
+    )
+
+
+@app.get("/payments/callback")
+async def payment_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    PesaPal redirects the customer here after payment.
+
+    We check the final transaction status and return a JSON summary.
+    In production your frontend callback_url handles the display — this
+    default endpoint is a fallback so users see something useful if the
+    frontend URL wasn't customised.
+    """
+    params = dict(request.query_params)
+    order_tracking_id = params.get("OrderTrackingId", "")
+    merchant_reference = params.get("OrderMerchantReference", "")
+
+    if not order_tracking_id:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Missing OrderTrackingId in callback", "status": "error"},
+        )
+
+    try:
+        tx = await PesapalService.get_transaction_status(order_tracking_id)
+    except Exception as e:
+        logger.error(f"Callback: failed to get transaction status: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={"message": "Could not verify payment status", "status": "error"},
+        )
+
+    status_map = {0: "INVALID", 1: "COMPLETED", 2: "FAILED", 3: "REVERSED"}
+    internal_status = status_map.get(tx.get("status_code"), "PENDING")
+
+    payment_order = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.order_tracking_id == order_tracking_id
+    ).first()
+
+    if payment_order and payment_order.status != internal_status:
+        payment_order.status = internal_status
+        payment_order.payment_method = tx.get("payment_method")
+        payment_order.confirmation_code = tx.get("confirmation_code")
+        payment_order.payment_account = tx.get("payment_account")
+        payment_order.payment_status_description = tx.get("payment_status_description")
+        payment_order.updated_at = datetime.utcnow()
+        db.commit()
+
+        if internal_status == "COMPLETED":
+            existing_enrollment = db.query(EnrollmentModel).filter(
+                EnrollmentModel.user_id == payment_order.user_id,
+                EnrollmentModel.course_id == payment_order.course_id,
+            ).first()
+            if not existing_enrollment:
+                db.add(EnrollmentModel(
+                    user_id=payment_order.user_id,
+                    course_id=payment_order.course_id,
+                ))
+                db.commit()
+
+    enrolled = False
+    if payment_order:
+        enrolled = db.query(EnrollmentModel).filter(
+            EnrollmentModel.user_id == payment_order.user_id,
+            EnrollmentModel.course_id == payment_order.course_id,
+        ).first() is not None
+
+    return JSONResponse(content={
+        "message": "Payment callback received",
+        "status": internal_status,
+        "order_tracking_id": order_tracking_id,
+        "merchant_reference": merchant_reference,
+        "payment_method": tx.get("payment_method"),
+        "amount": tx.get("amount"),
+        "currency": tx.get("currency"),
+        "confirmation_code": tx.get("confirmation_code"),
+        "enrolled": enrolled,
+    })
+
+
+@app.get("/payments/cancelled")
+async def payment_cancelled():
+    """PesaPal redirects here when the user cancels payment."""
+    return JSONResponse(content={
+        "message": "Payment was cancelled",
+        "status": "CANCELLED",
+    })
+
+
+@app.get("/payments/status/{merchant_reference}", response_model=PaymentStatusResponse)
+async def get_payment_status(
+    merchant_reference: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Check the current status of a payment by merchant_reference.
+    Users can only query their own payments.
+    """
+    payment_order = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.merchant_reference == merchant_reference,
+        PaymentOrderModel.user_id == current_user.id,
+    ).first()
+    if not payment_order:
+        raise HTTPException(status_code=404, detail="Payment order not found")
+
+    # Re-query PesaPal for live status if order is still PENDING
+    if payment_order.status == "PENDING" and payment_order.order_tracking_id:
+        try:
+            tx = await PesapalService.get_transaction_status(payment_order.order_tracking_id)
+            status_map = {0: "INVALID", 1: "COMPLETED", 2: "FAILED", 3: "REVERSED"}
+            fresh_status = status_map.get(tx.get("status_code"), "PENDING")
+            if fresh_status != "PENDING":
+                payment_order.status = fresh_status
+                payment_order.payment_method = tx.get("payment_method")
+                payment_order.confirmation_code = tx.get("confirmation_code")
+                payment_order.payment_account = tx.get("payment_account")
+                payment_order.payment_status_description = tx.get("payment_status_description")
+                payment_order.updated_at = datetime.utcnow()
+                db.commit()
+
+                if fresh_status == "COMPLETED":
+                    existing = db.query(EnrollmentModel).filter(
+                        EnrollmentModel.user_id == payment_order.user_id,
+                        EnrollmentModel.course_id == payment_order.course_id,
+                    ).first()
+                    if not existing:
+                        db.add(EnrollmentModel(
+                            user_id=payment_order.user_id,
+                            course_id=payment_order.course_id,
+                        ))
+                        db.commit()
+        except Exception as e:
+            logger.warning(f"Could not refresh payment status from PesaPal: {e}")
+
+    enrolled = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == payment_order.course_id,
+    ).first() is not None
+
+    return PaymentStatusResponse(
+        merchant_reference=payment_order.merchant_reference,
+        order_tracking_id=payment_order.order_tracking_id,
+        status=payment_order.status,
+        payment_method=payment_order.payment_method,
+        confirmation_code=payment_order.confirmation_code,
+        amount=payment_order.amount,
+        currency=payment_order.currency,
+        course_id=payment_order.course_id,
+        enrolled=enrolled,
+        message=payment_order.payment_status_description,
+    )
+
+
+@app.get("/payments/my-orders", response_model=List[PaymentOrderResponse])
+async def get_my_payment_orders(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all payment orders for the current user."""
+    orders = db.query(PaymentOrderModel).filter(
+        PaymentOrderModel.user_id == current_user.id
+    ).order_by(PaymentOrderModel.created_at.desc()).all()
+
+    result = []
+    for order in orders:
+        course = db.query(CourseModel).filter(CourseModel.id == order.course_id).first()
+        result.append(PaymentOrderResponse(
+            id=order.id,
+            user_id=order.user_id,
+            course_id=order.course_id,
+            merchant_reference=order.merchant_reference,
+            order_tracking_id=order.order_tracking_id,
+            amount=order.amount,
+            currency=order.currency,
+            status=order.status,
+            created_at=order.created_at,
+            updated_at=order.updated_at,
+            course_title=course.title if course else None,
+        ))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Migration
 # ---------------------------------------------------------------------------
@@ -2712,6 +3581,27 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
         "direct_image_url_endpoint": f"/courses/{course_id}/image-url",
         "presigned_url_preview": presigned_url,
     }
+
+
+@app.get("/debug/pesapal")
+async def debug_pesapal():
+    """
+    Verify PesaPal sandbox connectivity.
+    Returns token expiry and current IPN ID (useful during setup).
+    """
+    try:
+        token = await PesapalService.get_token()
+        ipn_id = PESAPAL_IPN_ID or "(not set — call POST /payments/register-ipn)"
+        return {
+            "status": "connected",
+            "environment": PESAPAL_ENV,
+            "base_url": PESAPAL_BASE_URL,
+            "token_preview": token[:20] + "..." if token else None,
+            "token_expires": PesapalService._token_expiry,
+            "ipn_id": ipn_id,
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 # ---------------------------------------------------------------------------
