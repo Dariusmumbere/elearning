@@ -1669,8 +1669,8 @@ async def create_course(
             )
         image_filename = await upload_to_b2(image_file, "courses")
         logger.info(f"Course image uploaded to B2: {image_filename}")
-    else:
-        image_filename = "courses/default-course-image.jpg"
+    # No default — leave image_filename as None so the frontend shows its placeholder
+    # instead of making a request for a file that may not exist in B2.
 
     db_course = CourseModel(
         title=title,
@@ -2537,15 +2537,19 @@ async def upload_course_image(
 @app.get("/b2-proxy/{filename:path}")
 async def b2_proxy(filename: str, request: Request):
     """
-    Resolve a private B2 object to a short-lived presigned URL and issue
-    an HTTP 307 redirect.
+    TRUE streaming proxy — fetches the object from B2 on the server side and
+    pipes the bytes directly to the browser.
 
-    Improvements over the original:
-    - Verifies the object exists (HEAD) before generating the URL, so we
-      can return a clean 404 instead of a broken redirect.
-    - Returns CORS headers so browsers on different origins don't block the
-      redirect follow-through.
-    - Strips query-string noise (e.g. ?t=cache-bust) before looking up the key.
+    WHY NOT REDIRECT:
+    Backblaze B2 presigned URLs do not include CORS headers in their response.
+    When the browser follows a cross-origin redirect (Vercel → Render → B2),
+    the final response from B2 lacks 'Access-Control-Allow-Origin', so the
+    browser blocks it with a CORS error.  Streaming through the server means
+    the browser only ever talks to Render (which has CORS configured correctly),
+    so the image bytes arrive without any CORS issue.
+
+    Supports Range requests so large images / videos load efficiently.
+    Sends Content-Type, Cache-Control, and ETag so browsers cache responses.
     """
     if not filename:
         raise HTTPException(status_code=400, detail="Filename is required")
@@ -2555,29 +2559,100 @@ async def b2_proxy(filename: str, request: Request):
     if not clean_filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 
-    # Verify existence first to give a meaningful 404 rather than a broken redirect
+    # ── HEAD: get metadata and confirm existence ──────────────────────────
     try:
-        b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=clean_filename)
+        head = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=clean_filename)
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
-        if error_code in ("404", "NoSuchKey"):
-            logger.warning(f"B2 proxy: object not found: {clean_filename}")
+        if error_code in ("404", "NoSuchKey", "403", "AccessDenied"):
+            logger.warning(f"B2 proxy: object not found/accessible: {clean_filename} ({error_code})")
             raise HTTPException(status_code=404, detail="File not found")
-        # Other errors (permissions, network) — still try to generate the URL
-        logger.warning(f"B2 HEAD warning for '{clean_filename}': {error_code}")
+        logger.error(f"B2 HEAD error for '{clean_filename}': {error_code}")
+        raise HTTPException(status_code=502, detail="Storage error")
 
-    presigned_url = await generate_presigned_url(clean_filename, expiration=3600)
-    if not presigned_url:
-        raise HTTPException(status_code=500, detail="Could not generate file URL")
+    file_size = head["ContentLength"]
+    content_type = head.get("ContentType") or "application/octet-stream"
+    etag = head.get("ETag", "").strip('"')
 
-    origin = request.headers.get("origin", "*")
-    return RedirectResponse(
-        url=presigned_url,
-        status_code=307,
+    # ── Range request support ────────────────────────────────────────────
+    range_header = request.headers.get("Range")
+    get_kwargs: dict = {"Bucket": B2_BUCKET_NAME, "Key": clean_filename}
+
+    if range_header:
+        try:
+            range_type, range_value = range_header.split("=", 1)
+            start_str, end_str = range_value.split("-", 1)
+            start = int(start_str) if start_str.strip() else 0
+            end = int(end_str) if end_str.strip() else file_size - 1
+            end = min(end, file_size - 1)
+            if start > end or start >= file_size:
+                raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+            get_kwargs["Range"] = f"bytes={start}-{end}"
+            content_length = end - start + 1
+            status_code = 206
+            content_range = f"bytes {start}-{end}/{file_size}"
+        except (ValueError, AttributeError):
+            # Malformed Range header — serve the full file
+            range_header = None
+
+    if not range_header:
+        start = 0
+        end = file_size - 1
+        content_length = file_size
+        status_code = 200
+        content_range = None
+
+    # ── Fetch from B2 and stream ─────────────────────────────────────────
+    try:
+        b2_response = b2_client.get_object(**get_kwargs)
+    except ClientError as e:
+        logger.error(f"B2 GET error for '{clean_filename}': {e}")
+        raise HTTPException(status_code=502, detail="Storage fetch error")
+
+    def _stream_body(body, chunk_size: int = 65536):
+        try:
+            with body as stream:
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as exc:
+            logger.error(f"B2 proxy stream error for '{clean_filename}': {exc}")
+
+    headers = {
+        "Content-Type": content_type,
+        "Content-Length": str(content_length),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    }
+    if etag:
+        headers["ETag"] = f'"{etag}"'
+    if content_range:
+        headers["Content-Range"] = content_range
+
+    return StreamingResponse(
+        _stream_body(b2_response["Body"]),
+        status_code=status_code,
+        headers=headers,
+        media_type=content_type,
+    )
+
+
+@app.options("/b2-proxy/{filename:path}")
+async def b2_proxy_options(filename: str):
+    """Handle CORS preflight for the proxy endpoint."""
+    return Response(
+        status_code=204,
         headers={
-            "Cache-Control": "public, max-age=3500",
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type, Authorization",
+            "Access-Control-Max-Age": "86400",
         },
     )
 
