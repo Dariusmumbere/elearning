@@ -64,10 +64,10 @@ b2_client = boto3.client(
 # ---------------------------------------------------------------------------
 # PesaPal Configuration
 # ---------------------------------------------------------------------------
-PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "TDpigBOOhs+zAl8cwH2Fl82jJGyD8xev")
-PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "1KpqkfsMaihIcOlhnBo/gBZ5smw=")
-# Sandbox URL for testing
-PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://cybqa.pesapal.com/pesapalv3")
+PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "lGw3V7l9BwOqZKttLM3Z8KcmopU1+tT1")
+PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCYFjn0y5n9xEs=")
+# Switch to https://pay.pesapal.com/v3 for production
+PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://pay.pesapal.com/v3")
 PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL", "https://elearning-1-r5di.onrender.com/payments/ipn")
 PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "https://online-coderise.vercel.app/payment/callback")
 COURSE_PRICE_UGX = 20000  # UGX 20,000 per month per course
