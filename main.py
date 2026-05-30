@@ -470,7 +470,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://online-yze5-myir9uasl-dariusmumberes-projects.vercel.app",
         "https://online-coderise.vercel.app",
-        "https://elearning-1-fyf2.onrender.com",
+        "https://elearning-1-r5di.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
