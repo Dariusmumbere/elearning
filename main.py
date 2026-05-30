@@ -990,8 +990,6 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
 
 # ---------------------------------------------------------------------------
 # NEW: Course Image URL endpoint
-# Returns a fresh presigned URL directly — bypasses the proxy redirect chain.
-# The frontend can use this as a second strategy if /b2-proxy/ fails.
 # ---------------------------------------------------------------------------
 
 @app.get("/courses/{course_id}/image-url", response_model=ImageUrlResponse)
@@ -999,11 +997,6 @@ async def get_course_image_url_endpoint(
     course_id: int,
     db: Session = Depends(get_db),
 ):
-    """
-    Return a fresh presigned URL for the course image.
-    No authentication required — the presigned URL itself is the credential.
-    Expires in 3600 seconds; clients should not cache beyond that.
-    """
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
@@ -1012,7 +1005,6 @@ async def get_course_image_url_endpoint(
     if not key:
         raise HTTPException(status_code=404, detail="Course has no image")
 
-    # Verify the object actually exists before generating URL
     try:
         b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=key)
     except ClientError as e:
@@ -1028,8 +1020,7 @@ async def get_course_image_url_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# NEW: Batch image URLs — fetch presigned URLs for multiple courses at once.
-# Reduces N round-trips on the course listing page to 1.
+# NEW: Batch image URLs
 # ---------------------------------------------------------------------------
 
 @app.post("/courses/image-urls")
@@ -1037,11 +1028,6 @@ async def get_bulk_course_image_urls(
     course_ids: List[int],
     db: Session = Depends(get_db),
 ):
-    """
-    Body: [1, 2, 3, ...]
-    Returns: {"1": "https://...", "2": "https://...", ...}
-    Missing or errored courses are omitted from the response.
-    """
     result = {}
     courses = db.query(CourseModel).filter(CourseModel.id.in_(course_ids)).all()
 
@@ -1063,8 +1049,36 @@ async def get_bulk_course_image_urls(
 
 
 # ---------------------------------------------------------------------------
-# Video Streaming
+# Video Streaming  ← KEY FIXES HERE
 # ---------------------------------------------------------------------------
+
+def _parse_range_header(range_header: str, file_size: int):
+    """
+    Parse an HTTP Range header and return (start, end).
+    Returns (None, None) on any parse failure so the caller can fall back to
+    a full-file response instead of raising a hard error.
+
+    Supports the common single-range form: "bytes=START-END"
+    """
+    try:
+        if not range_header or not range_header.strip().lower().startswith("bytes="):
+            return None, None
+        range_value = range_header.strip()[6:]   # strip "bytes="
+        parts = range_value.split("-", 1)
+        if len(parts) != 2:
+            return None, None
+        start_str, end_str = parts
+        start = int(start_str) if start_str.strip() else 0
+        end   = int(end_str)   if end_str.strip()   else file_size - 1
+        # Clamp to valid bounds
+        start = max(0, start)
+        end   = min(end, file_size - 1)
+        if start > end:
+            return None, None
+        return start, end
+    except (ValueError, AttributeError):
+        return None, None
+
 
 @app.get("/stream/video/{filename:path}")
 async def stream_video(
@@ -1073,140 +1087,120 @@ async def stream_video(
     token: str = Query(..., description="JWT token for video access"),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Video streaming request for filename: {filename}")
-    logger.info(f"Token received: {token[:20]}...")
+    logger.info(f"Video stream request — filename: {filename}")
 
+    # ── 1. Validate JWT ───────────────────────────────────────────────────
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("user_id")
-        lesson_id = payload.get("lesson_id")
-
-        logger.info(f"Token payload: {payload}")
-        logger.info(f"Requested filename: {filename}")
-
-        if not user_id or not lesson_id:
-            raise HTTPException(status_code=401, detail="Invalid video token")
-
-        user = db.query(UserModel).filter(UserModel.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-
-        lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
-        if not lesson:
-            raise HTTPException(status_code=404, detail="Lesson not found")
-
-        logger.info(f"Lesson filename from DB: {lesson.video_filename}")
-
-        enrollment = db.query(EnrollmentModel).filter(
-            EnrollmentModel.user_id == user_id,
-            EnrollmentModel.course_id == lesson.module.course_id,
-        ).first()
-        if not enrollment:
-            raise HTTPException(status_code=403, detail="Not enrolled in this course")
-
-        if not lesson.video_filename:
-            raise HTTPException(status_code=404, detail="Video not found for this lesson")
-
-        object_key = lesson.video_filename
-        logger.info(f"Using object key from database: {object_key}")
-
-        try:
-            head_response = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=object_key)
-            file_size = head_response['ContentLength']
-            content_type = head_response['ContentType'] or 'video/mp4'
-            logger.info(f"File exists in B2. Size: {file_size}, Type: {content_type}")
-        except ClientError as e:
-            logger.error(f"B2 HEAD Error: {e}")
-            raise HTTPException(status_code=404, detail=f"Video file not found in storage: {str(e)}")
-
-        range_header = request.headers.get("Range")
-        logger.info(f"Range header: {range_header}")
-
-        if range_header:
-            try:
-                range_type, range_value = range_header.split('=')
-                if range_type.strip().lower() != 'bytes':
-                    raise HTTPException(status_code=416, detail="Invalid Range Type")
-
-                start_str, end_str = range_value.split('-')
-                start = int(start_str) if start_str else 0
-                end = int(end_str) if end_str else file_size - 1
-
-                if start >= file_size or end >= file_size or start > end:
-                    raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
-
-                content_length = end - start + 1
-                byte_range = f"bytes={start}-{end}"
-                logger.info(f"Requesting byte range: {byte_range}, content length: {content_length}")
-
-                response = b2_client.get_object(
-                    Bucket=B2_BUCKET_NAME, Key=object_key, Range=byte_range
-                )
-
-                headers = {
-                    'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    'Accept-Ranges': 'bytes',
-                    'Content-Length': str(content_length),
-                    'Content-Type': content_type,
-                    'Cache-Control': 'public, max-age=3600',
-                }
-
-                def generate_chunks():
-                    try:
-                        chunk_size = 1024 * 1024
-                        with response['Body'] as stream:
-                            while True:
-                                chunk = stream.read(chunk_size)
-                                if not chunk:
-                                    break
-                                yield chunk
-                    except Exception as e:
-                        logger.error(f"Error during chunk streaming: {e}")
-                        raise
-
-                return StreamingResponse(
-                    generate_chunks(), status_code=206, headers=headers, media_type=content_type
-                )
-
-            except ClientError as e:
-                logger.error(f"Range Streaming Error: {e}")
-                raise HTTPException(status_code=500, detail="Error streaming video (range)")
-            except ValueError as e:
-                logger.error(f"Invalid range format: {e}")
-                raise HTTPException(status_code=416, detail="Invalid Range Format")
-
-        # Full video stream
-        logger.info("No range header, streaming full video")
-        response = b2_client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
-
-        headers = {
-            'Accept-Ranges': 'bytes',
-            'Content-Length': str(file_size),
-            'Content-Type': content_type,
-            'Cache-Control': 'public, max-age=3600',
-        }
-
-        def generate_full_chunks():
-            try:
-                chunk_size = 1024 * 1024
-                with response['Body'] as stream:
-                    while True:
-                        chunk = stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        yield chunk
-            except Exception as e:
-                logger.error(f"Error during full video streaming: {e}")
-                raise
-
-        return StreamingResponse(generate_full_chunks(), headers=headers, media_type=content_type)
-
     except JWTError as e:
-        logger.error(f"JWT Decode Error: {e}")
+        logger.error(f"Video JWT decode error: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired video token")
-    except Exception as e:
-        logger.error(f"Unexpected error in stream_video: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+
+    user_id  = payload.get("user_id")
+    lesson_id = payload.get("lesson_id")
+    logger.info(f"Token payload — user_id: {user_id}, lesson_id: {lesson_id}")
+
+    if not user_id or not lesson_id:
+        raise HTTPException(status_code=401, detail="Invalid video token: missing user_id or lesson_id")
+
+    # ── 2. DB lookups ─────────────────────────────────────────────────────
+    user = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    if not lesson.video_filename:
+        raise HTTPException(status_code=404, detail="No video attached to this lesson")
+
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == user_id,
+        EnrollmentModel.course_id == lesson.module.course_id,
+    ).first()
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+
+    object_key = lesson.video_filename
+    logger.info(f"B2 object key: {object_key}")
+
+    # ── 3. HEAD — confirm file exists and get metadata ────────────────────
+    try:
+        head = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=object_key)
+        file_size    = head["ContentLength"]
+        content_type = head.get("ContentType") or "video/mp4"
+        logger.info(f"B2 HEAD ok — size: {file_size}, type: {content_type}")
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        logger.error(f"B2 HEAD failed for '{object_key}': {error_code}")
+        raise HTTPException(status_code=404, detail=f"Video file not found in storage ({error_code})")
+
+    # ── 4. Parse Range header (graceful fallback to full file) ────────────
+    range_header = request.headers.get("Range")
+    logger.info(f"Range header: {range_header!r}")
+
+    start, end = _parse_range_header(range_header, file_size) if range_header else (None, None)
+
+    use_range   = start is not None
+    get_kwargs  = {"Bucket": B2_BUCKET_NAME, "Key": object_key}
+    if use_range:
+        get_kwargs["Range"] = f"bytes={start}-{end}"
+        content_length = end - start + 1
+        status_code    = 206
+        logger.info(f"Serving range bytes={start}-{end} ({content_length} bytes)")
+    else:
+        if range_header:
+            # Header present but unparseable — log a warning and serve the full file.
+            # This is more compatible than returning 416 for exotic Range formats.
+            logger.warning(f"Could not parse Range header '{range_header}', serving full file")
+        start          = 0
+        end            = file_size - 1
+        content_length = file_size
+        status_code    = 200
+        logger.info(f"Serving full file ({file_size} bytes)")
+
+    # ── 5. Fetch from B2 ──────────────────────────────────────────────────
+    try:
+        b2_response = b2_client.get_object(**get_kwargs)
+    except ClientError as e:
+        logger.error(f"B2 GET error for '{object_key}': {e}")
+        raise HTTPException(status_code=502, detail="Error fetching video from storage")
+
+    # ── 6. Stream bytes to client ─────────────────────────────────────────
+    CHUNK = 1024 * 1024  # 1 MiB
+
+    def generate_chunks():
+        try:
+            with b2_response["Body"] as stream:
+                while True:
+                    chunk = stream.read(CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as exc:
+            logger.error(f"Chunk streaming error for '{object_key}': {exc}")
+            # Generator can't raise HTTP exceptions; just stop — the client
+            # will see a truncated response and can retry.
+
+    headers = {
+        "Content-Type":   content_type,
+        "Content-Length": str(content_length),
+        "Accept-Ranges":  "bytes",
+        "Cache-Control":  "private, max-age=3600",
+        # Permit the Vercel frontend to read the response
+        "Access-Control-Allow-Origin":   "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    }
+    if use_range:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+    return StreamingResponse(
+        generate_chunks(),
+        status_code=status_code,
+        headers=headers,
+        media_type=content_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1233,7 +1227,7 @@ async def get_video_token_by_path(
     expires_delta = timedelta(minutes=VIDEO_TOKEN_EXPIRE_MINUTES)
     token_data = {"sub": "video_access", "user_id": current_user.id, "lesson_id": lesson_id}
     access_token = create_video_token(token_data, expires_delta=expires_delta)
-    logger.info(f"Video token generated for user {current_user.id}, lesson {lesson_id}")
+    logger.info(f"Video token issued — user: {current_user.id}, lesson: {lesson_id}")
     return {"token": access_token, "expires_at": datetime.utcnow() + expires_delta}
 
 
@@ -1669,8 +1663,6 @@ async def create_course(
             )
         image_filename = await upload_to_b2(image_file, "courses")
         logger.info(f"Course image uploaded to B2: {image_filename}")
-    # No default — leave image_filename as None so the frontend shows its placeholder
-    # instead of making a request for a file that may not exist in B2.
 
     db_course = CourseModel(
         title=title,
@@ -2531,35 +2523,18 @@ async def upload_course_image(
 
 
 # ---------------------------------------------------------------------------
-# B2 Proxy — 307 redirect to a fresh presigned URL
+# B2 Proxy — true streaming proxy (no redirect)
 # ---------------------------------------------------------------------------
 
 @app.get("/b2-proxy/{filename:path}")
 async def b2_proxy(filename: str, request: Request):
-    """
-    TRUE streaming proxy — fetches the object from B2 on the server side and
-    pipes the bytes directly to the browser.
-
-    WHY NOT REDIRECT:
-    Backblaze B2 presigned URLs do not include CORS headers in their response.
-    When the browser follows a cross-origin redirect (Vercel → Render → B2),
-    the final response from B2 lacks 'Access-Control-Allow-Origin', so the
-    browser blocks it with a CORS error.  Streaming through the server means
-    the browser only ever talks to Render (which has CORS configured correctly),
-    so the image bytes arrive without any CORS issue.
-
-    Supports Range requests so large images / videos load efficiently.
-    Sends Content-Type, Cache-Control, and ETag so browsers cache responses.
-    """
     if not filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 
-    # Strip any accidental query params that crept into the path segment
     clean_filename = filename.split("?")[0].strip("/")
     if not clean_filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 
-    # ── HEAD: get metadata and confirm existence ──────────────────────────
     try:
         head = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=clean_filename)
     except ClientError as e:
@@ -2570,39 +2545,27 @@ async def b2_proxy(filename: str, request: Request):
         logger.error(f"B2 HEAD error for '{clean_filename}': {error_code}")
         raise HTTPException(status_code=502, detail="Storage error")
 
-    file_size = head["ContentLength"]
+    file_size    = head["ContentLength"]
     content_type = head.get("ContentType") or "application/octet-stream"
-    etag = head.get("ETag", "").strip('"')
+    etag         = head.get("ETag", "").strip('"')
 
-    # ── Range request support ────────────────────────────────────────────
     range_header = request.headers.get("Range")
     get_kwargs: dict = {"Bucket": B2_BUCKET_NAME, "Key": clean_filename}
 
-    if range_header:
-        try:
-            range_type, range_value = range_header.split("=", 1)
-            start_str, end_str = range_value.split("-", 1)
-            start = int(start_str) if start_str.strip() else 0
-            end = int(end_str) if end_str.strip() else file_size - 1
-            end = min(end, file_size - 1)
-            if start > end or start >= file_size:
-                raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-            get_kwargs["Range"] = f"bytes={start}-{end}"
-            content_length = end - start + 1
-            status_code = 206
-            content_range = f"bytes {start}-{end}/{file_size}"
-        except (ValueError, AttributeError):
-            # Malformed Range header — serve the full file
-            range_header = None
+    start, end = _parse_range_header(range_header, file_size) if range_header else (None, None)
 
-    if not range_header:
-        start = 0
-        end = file_size - 1
+    if start is not None:
+        get_kwargs["Range"] = f"bytes={start}-{end}"
+        content_length = end - start + 1
+        status_code    = 206
+        content_range  = f"bytes {start}-{end}/{file_size}"
+    else:
+        start          = 0
+        end            = file_size - 1
         content_length = file_size
-        status_code = 200
-        content_range = None
+        status_code    = 200
+        content_range  = None
 
-    # ── Fetch from B2 and stream ─────────────────────────────────────────
     try:
         b2_response = b2_client.get_object(**get_kwargs)
     except ClientError as e:
@@ -2621,13 +2584,13 @@ async def b2_proxy(filename: str, request: Request):
             logger.error(f"B2 proxy stream error for '{clean_filename}': {exc}")
 
     headers = {
-        "Content-Type": content_type,
+        "Content-Type":   content_type,
         "Content-Length": str(content_length),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=3600",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Accept-Ranges":  "bytes",
+        "Cache-Control":  "public, max-age=3600",
+        "Access-Control-Allow-Origin":   "*",
+        "Access-Control-Allow-Methods":  "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers":  "Range, Content-Type",
         "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
     }
     if etag:
@@ -2645,14 +2608,13 @@ async def b2_proxy(filename: str, request: Request):
 
 @app.options("/b2-proxy/{filename:path}")
 async def b2_proxy_options(filename: str):
-    """Handle CORS preflight for the proxy endpoint."""
     return Response(
         status_code=204,
         headers={
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin":  "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Range, Content-Type, Authorization",
-            "Access-Control-Max-Age": "86400",
+            "Access-Control-Max-Age":       "86400",
         },
     )
 
