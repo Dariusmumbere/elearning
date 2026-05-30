@@ -62,12 +62,26 @@ b2_client = boto3.client(
 )
 
 # ---------------------------------------------------------------------------
-# PesaPal Configuration
+# PesaPal Configuration - SANDBOX MODE FOR TESTING
 # ---------------------------------------------------------------------------
-PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "lGw3V7l9BwOqZKttLM3Z8KcmopU1+tT1")
-PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCYFjn0y5n9xEs=")
-# Switch to https://pay.pesapal.com/v3 for production
-PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://pay.pesapal.com/v3")
+# Set USE_PESAPAL_SANDBOX=True for testing, False for production
+USE_PESAPAL_SANDBOX = os.getenv("USE_PESAPAL_SANDBOX", "True").lower() == "true"
+
+if USE_PESAPAL_SANDBOX:
+    # Sandbox credentials (test credentials)
+    PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_SANDBOX_CONSUMER_KEY", "TDpigBOOhs+zAl8cwH2Fl82jJGyD8xev")
+    PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_SANDBOX_CONSUMER_SECRET", "1KpqkfsMaihIcOlhnBo/gBZ5smw=")
+    PESAPAL_BASE_URL = os.getenv("PESAPAL_SANDBOX_BASE_URL", "https://cybqa.pesapal.com/pesapalv3")
+    logger.info("=== PESAPAL RUNNING IN SANDBOX MODE FOR TESTING ===")
+else:
+    # Production credentials (keep your existing production credentials)
+    PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "lGw3V7l9BwOqZKttLM3Z8KcmopU1+tT1")
+    PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCYFjn0y5n9xEs=")
+    PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://pay.pesapal.com/v3")
+    logger.info("=== PESAPAL RUNNING IN PRODUCTION MODE ===")
+
+# IPN and Callback URLs - these should work for both sandbox and production
+# The same endpoint handles both; PesaPal will call the appropriate URL based on environment
 PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL", "https://elearning-1-r5di.onrender.com/payments/ipn")
 PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "https://online-coderise.vercel.app/payment/callback")
 COURSE_PRICE_UGX = 20000  # UGX 20,000 per month per course
@@ -739,13 +753,14 @@ def get_cached_quiz_questions(user_id: int, lesson_id: int, quiz_id: str):
 
 
 # ---------------------------------------------------------------------------
-# PesaPal Helpers
+# PesaPal Helpers (Sandbox/Production aware)
 # ---------------------------------------------------------------------------
 
 def pesapal_get_token() -> str:
     """
     Authenticate with PesaPal and return a bearer token.
     Tokens are cached in memory and reused until they expire.
+    Works with both Sandbox and Production environments.
     """
     global _pesapal_token_cache
 
@@ -768,6 +783,7 @@ def pesapal_get_token() -> str:
     }
 
     logger.info(f"Requesting PesaPal token from {auth_url}")
+    logger.info(f"Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     logger.debug(f"Auth payload: {payload}")
 
     try:
@@ -810,6 +826,7 @@ def pesapal_register_ipn(token: str) -> str:
     """
     Register the IPN URL with PesaPal and return the ipn_id.
     Only registers once per process lifetime; subsequent calls return cached ID.
+    Works with both Sandbox and Production environments.
     """
     global _pesapal_ipn_id
 
@@ -837,6 +854,7 @@ def pesapal_register_ipn(token: str) -> str:
     }
 
     logger.info(f"Registering IPN URL: {PESAPAL_IPN_URL}")
+    logger.info(f"Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     logger.info(f"IPN registration request to {ipn_url}")
     logger.debug(f"IPN payload: {payload}")
 
@@ -879,6 +897,7 @@ def pesapal_submit_order(
     """
     Submit an order to PesaPal and return the response dict containing
     order_tracking_id and redirect_url.
+    Works with both Sandbox and Production environments.
     """
     order_url = f"{PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest"
     payload = {
@@ -909,6 +928,7 @@ def pesapal_submit_order(
     }
 
     logger.info(f"Submitting order to PesaPal: {order_url}")
+    logger.info(f"Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     logger.info(f"Order payload: {json.dumps(payload, indent=2)}")
     logger.info(f"Callback URL: {callback_url}")
 
@@ -946,8 +966,7 @@ def pesapal_submit_order(
     # PesaPal sometimes returns {"status": "200", ...} on success
     status_val = data.get("status")
     if status_val and str(status_val) not in ("200", "0"):
-        # status "0" sometimes means success in PesaPal v3
-        logger.warning(f"PesaPal unexpected status value: {status_val}")
+        # status "0" sometimes means success in PesaPal v3        logger.warning(f"PesaPal unexpected status value: {status_val}")
 
     redirect_url = data.get("redirect_url")
     if not redirect_url:
@@ -962,7 +981,8 @@ def pesapal_submit_order(
 
 
 def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
-    """Query PesaPal for the current status of a transaction."""
+    """Query PesaPal for the current status of a transaction.
+    Works with both Sandbox and Production environments."""
     status_url = f"{PESAPAL_BASE_URL}/api/Transactions/GetTransactionStatus"
     headers = {
         "Accept": "application/json",
@@ -971,6 +991,7 @@ def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
     params = {"orderTrackingId": order_tracking_id}
 
     logger.info(f"Querying transaction status for {order_tracking_id}")
+    logger.info(f"Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     logger.info(f"Status URL: {status_url}")
     logger.debug(f"Query params: {params}")
 
@@ -1311,9 +1332,11 @@ async def initiate_payment(
     """
     Initiate a PesaPal payment for a course enrollment.
     Returns the PesaPal redirect URL where the user completes payment.
+    Works with Sandbox when USE_PESAPAL_SANDBOX=True.
     """
     logger.info(f"=== PAYMENT INITIATION START ===")
     logger.info(f"Course ID: {course_id}, User: {current_user.email} (ID: {current_user.id})")
+    logger.info(f"PesaPal Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     
     # Verify course exists and is published
     course = db.query(CourseModel).filter(
@@ -1434,6 +1457,7 @@ async def payment_callback(
     Redirects the user to the frontend with the result.
     """
     logger.info(f"=== PAYMENT CALLBACK RECEIVED ===")
+    logger.info(f"PesaPal Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     
     # Log ALL request details
     logger.info(f"Callback URL: {request.url}")
@@ -1533,6 +1557,7 @@ async def payment_ipn(
     We query PesaPal for the latest status and update our records.
     """
     logger.info(f"=== IPN RECEIVED ===")
+    logger.info(f"PesaPal Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     
     # Log ALL request details
     logger.info(f"IPN URL: {request.url}")
@@ -3434,20 +3459,27 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
 
 @app.get("/debug/pesapal")
 async def debug_pesapal():
-    """Test PesaPal authentication and IPN registration. Remove in production."""
-    logger.info("=== PESAPAL DEBUG ENDPOINT CALLED ===")
+    """Test PesaPal authentication and IPN registration in current environment (Sandbox or Production)."""
+    logger.info(f"=== PESAPAL DEBUG ENDPOINT CALLED ===")
+    logger.info(f"Current environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     try:
         token = pesapal_get_token()
         ipn_id = pesapal_register_ipn(token)
         return {
             "status": "ok",
+            "environment": "SANDBOX" if USE_PESAPAL_SANDBOX else "PRODUCTION",
+            "base_url": PESAPAL_BASE_URL,
             "token_cached": bool(token),
             "ipn_id": ipn_id,
-            "base_url": PESAPAL_BASE_URL,
         }
     except HTTPException as e:
         logger.error(f"PesaPal debug error: {e.detail}")
-        return {"status": "error", "detail": e.detail}
+        return {
+            "status": "error",
+            "environment": "SANDBOX" if USE_PESAPAL_SANDBOX else "PRODUCTION",
+            "base_url": PESAPAL_BASE_URL,
+            "detail": e.detail
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3456,7 +3488,11 @@ async def debug_pesapal():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "pesapal_environment": "SANDBOX" if USE_PESAPAL_SANDBOX else "PRODUCTION"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3466,6 +3502,7 @@ def health_check():
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running startup migrations...")
+    logger.info(f"PesaPal Environment: {'SANDBOX' if USE_PESAPAL_SANDBOX else 'PRODUCTION'}")
     db = SessionLocal()
     try:
         Base.metadata.create_all(bind=engine)
