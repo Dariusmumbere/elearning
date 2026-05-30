@@ -892,11 +892,37 @@ def pesapal_submit_order(
         logger.error(f"PesaPal SubmitOrderRequest error: {e}")
         raise HTTPException(status_code=502, detail="Could not submit payment order to PesaPal.")
 
-    if "error" in data:
-        logger.error(f"PesaPal order error: {data['error']}")
+    logger.info(f"PesaPal SubmitOrderRequest response: {data}")
+
+    # -----------------------------------------------------------------------
+    # FIX: Robust error handling — data['error'] can be None, a dict, or absent.
+    # -----------------------------------------------------------------------
+    error_field = data.get("error")
+    if error_field is not None:
+        # error_field could be a dict with a 'message' key, or some other truthy value
+        if isinstance(error_field, dict):
+            error_message = error_field.get("message") or error_field.get("errorMessage") or str(error_field)
+        else:
+            error_message = str(error_field)
+        logger.error(f"PesaPal order error field: {error_field}")
         raise HTTPException(
             status_code=502,
-            detail=f"PesaPal error: {data['error'].get('message', 'Unknown error')}"
+            detail=f"PesaPal error: {error_message}",
+        )
+
+    # Also check for a top-level status indicating failure
+    # PesaPal sometimes returns {"status": "200", ...} on success
+    status_val = data.get("status")
+    if status_val and str(status_val) not in ("200", "0"):
+        # status "0" sometimes means success in PesaPal v3
+        logger.warning(f"PesaPal unexpected status value: {status_val}")
+
+    redirect_url = data.get("redirect_url")
+    if not redirect_url:
+        logger.error(f"PesaPal response missing redirect_url: {data}")
+        raise HTTPException(
+            status_code=502,
+            detail="PesaPal did not return a payment URL. Please try again.",
         )
 
     return data
@@ -3336,3 +3362,4 @@ if __name__ == "__main__":
     import uvicorn
     Base.metadata.create_all(bind=engine)
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
