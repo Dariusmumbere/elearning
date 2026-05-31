@@ -36,10 +36,14 @@ from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.graphics.shapes import Drawing, Rect, Circle, Line, Polygon, String as GString
+from reportlab.graphics import renderPDF
+from reportlab.platypus import Flowable
 import base64
 from io import BytesIO
 import hashlib
 import asyncio
+import math
 import redis
 import pickle
 
@@ -1150,133 +1154,307 @@ def generate_certificate_hash(user_id: int, course_id: int) -> str:
     return hashlib.sha256(unique_string.encode()).hexdigest()[:16]
 
 
+# ---------------------------------------------------------------------------
+# Modern Certificate PDF
+# ---------------------------------------------------------------------------
+
+class _HRule(Flowable):
+    """A thin horizontal rule with optional color."""
+    def __init__(self, width, thickness=1, color=colors.black):
+        super().__init__()
+        self.width = width
+        self.thickness = thickness
+        self.color = color
+        self.height = thickness + 2
+
+    def draw(self):
+        self.canv.setStrokeColor(self.color)
+        self.canv.setLineWidth(self.thickness)
+        self.canv.line(0, self.thickness / 2, self.width, self.thickness / 2)
+
+
+def _draw_certificate_background(canvas, doc):
+    """Draw the decorative page background, borders, and watermark elements."""
+    canvas.saveState()
+    W, H = A4  # 595.27 x 841.89 pts
+
+    # ── Deep navy background ──────────────────────────────────────────────
+    canvas.setFillColor(colors.HexColor('#0B1A2E'))
+    canvas.rect(0, 0, W, H, fill=1, stroke=0)
+
+    # ── Top gold band ─────────────────────────────────────────────────────
+    canvas.setFillColor(colors.HexColor('#C9A84C'))
+    canvas.rect(0, H - 58, W, 58, fill=1, stroke=0)
+
+    # ── Bottom gold band ──────────────────────────────────────────────────
+    canvas.setFillColor(colors.HexColor('#C9A84C'))
+    canvas.rect(0, 0, W, 58, fill=1, stroke=0)
+
+    # ── Thin white accent lines just inside the bands ─────────────────────
+    canvas.setStrokeColor(colors.white)
+    canvas.setLineWidth(1)
+    canvas.line(0, H - 62, W, H - 62)
+    canvas.line(0, 62, W, 62)
+
+    # ── Side accent bars (narrow gold) ────────────────────────────────────
+    canvas.setFillColor(colors.HexColor('#C9A84C'))
+    canvas.rect(0, 58, 14, H - 116, fill=1, stroke=0)
+    canvas.rect(W - 14, 58, 14, H - 116, fill=1, stroke=0)
+
+    # ── Inner white accent lines beside the side bars ─────────────────────
+    canvas.setStrokeColor(colors.HexColor('#FFFFFF'))
+    canvas.setLineWidth(0.5)
+    canvas.line(18, 62, 18, H - 62)
+    canvas.line(W - 18, 62, W - 18, H - 62)
+
+    # ── Decorative corner diamonds (top-left, top-right, bottom-left, bottom-right)
+    gold = colors.HexColor('#C9A84C')
+    white = colors.white
+    corners = [(14, H - 58), (W - 14, H - 58), (14, 58), (W - 14, 58)]
+    for cx, cy in corners:
+        # Outer diamond
+        canvas.setFillColor(colors.HexColor('#0B1A2E'))
+        canvas.setStrokeColor(gold)
+        canvas.setLineWidth(1.5)
+        size = 10
+        p = canvas.beginPath()
+        p.moveTo(cx, cy + size)
+        p.lineTo(cx + size, cy)
+        p.lineTo(cx, cy - size)
+        p.lineTo(cx - size, cy)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=1)
+        # Inner dot
+        canvas.setFillColor(gold)
+        canvas.circle(cx, cy, 3, fill=1, stroke=0)
+
+    # ── Watermark seal (large faint circle in centre) ─────────────────────
+    canvas.setStrokeColor(colors.HexColor('#1A2E4A'))
+    canvas.setLineWidth(1)
+    cx, cy = W / 2, H / 2
+    for r in (100, 108, 116):
+        canvas.circle(cx, cy, r, fill=0, stroke=1)
+
+    # Star points around outer ring
+    canvas.setStrokeColor(colors.HexColor('#1A2E4A'))
+    canvas.setLineWidth(0.5)
+    for i in range(24):
+        angle = math.radians(i * 15)
+        x1 = cx + 112 * math.cos(angle)
+        y1 = cy + 112 * math.sin(angle)
+        x2 = cx + 120 * math.cos(angle)
+        y2 = cy + 120 * math.sin(angle)
+        canvas.line(x1, y1, x2, y2)
+
+    # ── Platform name in gold inside the bands ────────────────────────────
+    canvas.setFillColor(colors.HexColor('#0B1A2E'))
+    canvas.setFont("Helvetica-Bold", 13)
+    canvas.drawCentredString(W / 2, H - 38, "C O D E R I S E   A C A D E M Y")
+
+    canvas.setFillColor(colors.HexColor('#0B1A2E'))
+    canvas.setFont("Helvetica", 9)
+    canvas.drawCentredString(W / 2, 22, "online-coderise.vercel.app  ·  Empowering Learners Worldwide")
+
+    canvas.restoreState()
+
+
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
-    """Create a visually appealing certificate PDF."""
+    """Create a modern, premium certificate PDF."""
     buffer = BytesIO()
+
+    # Page margins: inside the decorative side bars (14 pt) + padding
+    left_margin = 38
+    right_margin = 38
+    top_margin = 72      # clear the top gold band (58) + a bit
+    bottom_margin = 72   # clear the bottom gold band
+
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        leftMargin=0.5 * inch,
-        rightMargin=0.5 * inch,
-        topMargin=0.5 * inch,
-        bottomMargin=0.5 * inch,
+        leftMargin=left_margin,
+        rightMargin=right_margin,
+        topMargin=top_margin,
+        bottomMargin=bottom_margin,
     )
+
+    W, H = A4
+    usable_width = W - left_margin - right_margin   # ~519 pt
+
+    # ── Colour palette ────────────────────────────────────────────────────
+    GOLD      = colors.HexColor('#C9A84C')
+    LIGHT_GOLD = colors.HexColor('#E8D5A3')
+    WHITE     = colors.white
+    LIGHT_BLUE = colors.HexColor('#A8C8E8')
+    SILVER    = colors.HexColor('#C0C0C0')
+
+    # ── Paragraph styles ──────────────────────────────────────────────────
+    def _style(name, font='Helvetica', size=12, color=WHITE, space_before=0, space_after=8, align=TA_CENTER, leading=None):
+        return ParagraphStyle(
+            name,
+            fontName=font,
+            fontSize=size,
+            textColor=color,
+            spaceBefore=space_before,
+            spaceAfter=space_after,
+            alignment=align,
+            leading=leading or size * 1.2,
+        )
+
+    style_eyebrow  = _style('eyebrow',  'Helvetica',      9,  LIGHT_GOLD,   0,  4,  TA_CENTER)
+    style_big_title= _style('bigtitle', 'Helvetica-Bold', 30, GOLD,         0, 10,  TA_CENTER, 34)
+    style_subtitle = _style('subtitle', 'Helvetica',      11, LIGHT_BLUE,   0,  6,  TA_CENTER)
+    style_present  = _style('present',  'Helvetica',      11, SILVER,       6,  4,  TA_CENTER)
+    style_name     = _style('name',     'Helvetica-Bold', 28, WHITE,        4, 10,  TA_CENTER, 32)
+    style_for_comp = _style('forcomp',  'Helvetica',      10, SILVER,       0,  4,  TA_CENTER)
+    style_course   = _style('course',   'Helvetica-Bold', 18, GOLD,         4, 10,  TA_CENTER, 22)
+    style_body     = _style('body',     'Helvetica',      10, SILVER,       4,  4,  TA_CENTER)
+    style_date     = _style('date',     'Helvetica',      10, LIGHT_GOLD,   2,  2,  TA_CENTER)
+    style_hash     = _style('hash',     'Helvetica',       7, colors.HexColor('#5A7A9A'), 8, 0, TA_CENTER)
+    style_sig_name = _style('signame',  'Helvetica-Bold', 10, WHITE,        2,  0,  TA_CENTER)
+    style_sig_role = _style('sigrole',  'Helvetica',       8, SILVER,       0,  0,  TA_CENTER)
+
     elements = []
-    styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle(
-        'CertificateTitle', parent=styles['Title'],
-        fontSize=36, spaceAfter=30, alignment=TA_CENTER,
-        textColor=colors.HexColor('#2C3E50'), fontName='Helvetica-Bold',
-    )
-    subtitle_style = ParagraphStyle(
-        'CertificateSubtitle', parent=styles['Heading2'],
-        fontSize=20, spaceAfter=20, alignment=TA_CENTER,
-        textColor=colors.HexColor('#34495E'), fontName='Helvetica',
-    )
-    normal_style = ParagraphStyle(
-        'CertificateNormal', parent=styles['Normal'],
-        fontSize=16, spaceAfter=12, alignment=TA_CENTER,
-        textColor=colors.HexColor('#7F8C8D'), fontName='Helvetica',
-    )
-    name_style = ParagraphStyle(
-        'CertificateName', parent=styles['Heading1'],
-        fontSize=42, spaceAfter=30, alignment=TA_CENTER,
-        textColor=colors.HexColor('#2980B9'), fontName='Helvetica-Bold',
-    )
-    small_style = ParagraphStyle(
-        'CertificateSmall', parent=styles['Normal'],
-        fontSize=10, alignment=TA_CENTER,
-        textColor=colors.HexColor('#BDC3C7'), fontName='Helvetica',
-    )
-
-    def draw_border(canvas, doc):
-        canvas.saveState()
-        canvas.setStrokeColor(colors.HexColor('#E67E22'))
-        canvas.setLineWidth(2)
-        x, y = doc.leftMargin / 2, doc.bottomMargin / 2
-        width = doc.pagesize[0] - doc.leftMargin
-        height = doc.pagesize[1] - doc.bottomMargin
-        canvas.rect(x, y, width, height, stroke=1, fill=0)
-        canvas.restoreState()
-
+    # ── Logo (attempt remote fetch; fall back to text) ────────────────────
     try:
-        logo_url = "https://raw.githubusercontent.com/Dariusmumbere/elearning/main/logo.png"
-        response = requests.get(logo_url)
-        if response.status_code == 200:
-            logo_img = Image(BytesIO(response.content))
-            logo_img.drawHeight = 1.5 * inch * logo_img.drawHeight / logo_img.drawWidth
-            logo_img.drawWidth = 1.5 * inch
+        logo_resp = requests.get(
+            "https://raw.githubusercontent.com/Dariusmumbere/elearning/main/logo.png",
+            timeout=5
+        )
+        if logo_resp.status_code == 200:
+            logo_img = Image(BytesIO(logo_resp.content))
+            aspect = logo_img.imageWidth / logo_img.imageHeight
+            logo_img.drawWidth  = 0.7 * inch
+            logo_img.drawHeight = 0.7 * inch / aspect
             logo_img.hAlign = 'CENTER'
             elements.append(logo_img)
-            elements.append(Spacer(1, 0.2 * inch))
+            elements.append(Spacer(1, 6))
     except Exception as e:
-        logger.warning(f"Could not load logo: {e}")
-        elements.append(Paragraph("eLearning Platform", subtitle_style))
+        logger.warning(f"Could not load logo for certificate: {e}")
 
-    elements.append(Spacer(1, 0.5 * inch))
-    elements.append(Paragraph("CERTIFICATE OF ACHIEVEMENT", title_style))
-    elements.append(Spacer(1, 0.2 * inch))
+    # ── Eye-brow text ─────────────────────────────────────────────────────
+    elements.append(Paragraph("— OFFICIAL CERTIFICATE —", style_eyebrow))
+    elements.append(Spacer(1, 4))
 
-    line = Table([['']], colWidths=[4 * inch], rowHeights=[0.02 * inch])
-    line.setStyle(TableStyle([('LINEABOVE', (0, 0), (-1, -1), 2, colors.HexColor('#3498DB'))]))
-    elements.append(line)
-    elements.append(Spacer(1, 0.4 * inch))
+    # ── Main title ────────────────────────────────────────────────────────
+    elements.append(Paragraph("Certificate of Achievement", style_big_title))
 
-    elements.append(Paragraph("This is to certify that", normal_style))
-    elements.append(Spacer(1, 0.2 * inch))
+    # ── Gold divider ──────────────────────────────────────────────────────
+    elements.append(Spacer(1, 6))
+    elements.append(_HRule(usable_width, thickness=2, color=GOLD))
+    elements.append(Spacer(1, 2))
+    elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
+    elements.append(Spacer(1, 12))
 
-    name_bg = Table([[Paragraph(user.full_name.upper(), name_style)]], colWidths=[6 * inch])
-    name_bg.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F5F5F5')),
-        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#E0E0E0')),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    # ── Subtitle ──────────────────────────────────────────────────────────
+    elements.append(Paragraph("This is to proudly certify that", style_present))
+    elements.append(Spacer(1, 8))
+
+    # ── Recipient name in a styled box ───────────────────────────────────
+    name_table = Table(
+        [[Paragraph(user.full_name, style_name)]],
+        colWidths=[usable_width],
+    )
+    name_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#102040')),
+        ('BOX',        (0, 0), (-1, -1), 1.5, GOLD),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 18),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 18),
+        ('TOPPADDING',   (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 10),
+        ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
     ]))
-    elements.append(name_bg)
-    elements.append(Spacer(1, 0.3 * inch))
+    elements.append(name_table)
+    elements.append(Spacer(1, 14))
 
-    elements.append(Paragraph("has successfully completed the course", normal_style))
-    elements.append(Spacer(1, 0.3 * inch))
+    # ── Completion line ───────────────────────────────────────────────────
+    elements.append(Paragraph("has successfully completed all requirements for the course", style_for_comp))
+    elements.append(Spacer(1, 8))
 
-    course_bg = Table([[Paragraph(f'"{course.title}"', subtitle_style)]], colWidths=[6 * inch])
-    course_bg.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F0F8FF')),
-        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#B0C4DE')),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    # ── Course title in gold accent box ───────────────────────────────────
+    course_table = Table(
+        [[Paragraph(course.title, style_course)]],
+        colWidths=[usable_width],
+    )
+    course_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#0D2240')),
+        ('BOX',        (0, 0), (-1, -1), 0.75, LIGHT_GOLD),
+        ('LINEBELOW',  (0, 0), (-1, -1), 3, GOLD),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 24),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 24),
+        ('TOPPADDING',   (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 12),
+        ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
     ]))
-    elements.append(course_bg)
-    elements.append(Spacer(1, 0.4 * inch))
+    elements.append(course_table)
+    elements.append(Spacer(1, 14))
 
+    # ── Body copy ─────────────────────────────────────────────────────────
+    elements.append(Paragraph(
+        "demonstrating dedication, commitment, and mastery of the curriculum.",
+        style_body
+    ))
+    elements.append(Spacer(1, 4))
+
+    # ── Issue date ────────────────────────────────────────────────────────
     completion_date = datetime.utcnow().strftime("%B %d, %Y")
-    elements.append(Paragraph(f"Awarded on {completion_date}", normal_style))
-    elements.append(Spacer(1, 0.5 * inch))
+    elements.append(Paragraph(f"Issued on  {completion_date}", style_date))
+    elements.append(Spacer(1, 16))
 
-    signature_data = [
-        ["_________________________", "_________________________"],
-        ["Course Instructor", "Platform Director"],
-    ]
-    signature_table = Table(signature_data, colWidths=[3 * inch, 3 * inch])
-    signature_table.setStyle(TableStyle([
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTSIZE', (0, 0), (-1, -1), 12),
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#7F8C8D')),
-        ('LINEABOVE', (0, 0), (-1, 0), 1, colors.HexColor('#2C3E50')),
+    # ── Second divider ────────────────────────────────────────────────────
+    elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
+    elements.append(Spacer(1, 2))
+    elements.append(_HRule(usable_width, thickness=2, color=GOLD))
+    elements.append(Spacer(1, 18))
+
+    # ── Signature row ─────────────────────────────────────────────────────
+    col = usable_width / 3
+
+    def _sig_cell(name, role):
+        return [
+            Paragraph("______________________", _style('sigline', 'Helvetica', 10, SILVER, 0, 2, TA_CENTER)),
+            Paragraph(name, style_sig_name),
+            Paragraph(role, style_sig_role),
+        ]
+
+    sig_data = [[
+        _sig_cell("Course Instructor", "Lead Instructor"),
+        _sig_cell("CodeRise Academy", "Issuing Authority"),
+        _sig_cell("Academic Director", "Platform Director"),
+    ]]
+    sig_table = Table(sig_data, colWidths=[col, col, col])
+    sig_table.setStyle(TableStyle([
+        ('ALIGN',   (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',  (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
     ]))
-    elements.append(signature_table)
-    elements.append(Spacer(1, 0.4 * inch))
+    elements.append(sig_table)
+    elements.append(Spacer(1, 16))
 
-    cert_id_bg = Table([[Paragraph(f"Certificate ID: {certificate_hash}", small_style)]], colWidths=[6 * inch])
-    cert_id_bg.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F5F5F5')),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    # ── Certificate ID footer ─────────────────────────────────────────────
+    id_table = Table(
+        [[Paragraph(f"Certificate ID: {certificate_hash.upper()}  ·  Verify at online-coderise.vercel.app/verify", style_hash)]],
+        colWidths=[usable_width],
+    )
+    id_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#061220')),
+        ('BOX',        (0, 0), (-1, -1), 0.5, colors.HexColor('#1E3A5A')),
+        ('TOPPADDING',   (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 6),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
     ]))
-    elements.append(cert_id_bg)
+    elements.append(id_table)
 
-    doc.build(elements, onFirstPage=draw_border, onLaterPages=draw_border)
+    # ── Build PDF ─────────────────────────────────────────────────────────
+    doc.build(
+        elements,
+        onFirstPage=_draw_certificate_background,
+        onLaterPages=_draw_certificate_background,
+    )
     buffer.seek(0)
     return buffer
 
@@ -3661,7 +3839,7 @@ async def startup_event():
 
 
 # ---------------------------------------------------------------------------
-# Entry point                                                                                                                                                                                             
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
