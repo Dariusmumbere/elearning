@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr, validator
@@ -3625,6 +3625,28 @@ async def startup_event():
     try:
         Base.metadata.create_all(bind=engine)
         migrate_has_quiz_default(db)
+        # Add missing columns if they don't exist
+        with engine.begin() as conn:
+            conn.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS bio TEXT;
+            """))
+            conn.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS profile_image_filename VARCHAR(255);
+            """))
+            conn.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS location VARCHAR(255);
+            """))
+            conn.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS website VARCHAR(255);
+            """))
+            conn.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+            """))
         logger.info("Startup migrations completed successfully")
         # Pre-register PesaPal IPN on startup so it's ready for first payment
         try:
@@ -3640,7 +3662,7 @@ async def startup_event():
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point                                                                                                                                                                                             
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
