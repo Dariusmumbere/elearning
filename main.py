@@ -110,6 +110,12 @@ class UserModel(Base):
     is_active = Column(Boolean, default=True)
     is_instructor = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # --- NEW profile fields ---
+    bio = Column(Text, nullable=True)
+    profile_image_filename = Column(String, nullable=True)
+    location = Column(String, nullable=True)
+    website = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
 
     courses = relationship("CourseModel", back_populates="instructor")
     enrollments = relationship("EnrollmentModel", back_populates="user")
@@ -267,6 +273,37 @@ class User(UserBase):
     is_active: bool
     is_instructor: bool
     created_at: datetime
+    bio: Optional[str] = None
+    profile_image_filename: Optional[str] = None
+    location: Optional[str] = None
+    website: Optional[str] = None
+    phone: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
+# --- NEW: Profile update schema ---
+class ProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    bio: Optional[str] = None
+    location: Optional[str] = None
+    website: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class ProfileResponse(BaseModel):
+    id: int
+    email: str
+    full_name: str
+    is_active: bool
+    is_instructor: bool
+    created_at: datetime
+    bio: Optional[str] = None
+    profile_image_url: Optional[str] = None
+    location: Optional[str] = None
+    website: Optional[str] = None
+    phone: Optional[str] = None
 
     class Config:
         orm_mode = True
@@ -1723,6 +1760,123 @@ async def get_my_payments(
             "created_at": p.created_at,
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Profile Routes  ← NEW
+# ---------------------------------------------------------------------------
+
+@app.get("/users/me/profile", response_model=ProfileResponse)
+async def get_my_profile(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return full profile for the currently authenticated user, including presigned avatar URL."""
+    profile_image_url = None
+    if current_user.profile_image_filename:
+        profile_image_url = f"/b2-proxy/{current_user.profile_image_filename}"
+
+    return ProfileResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        is_active=current_user.is_active,
+        is_instructor=current_user.is_instructor,
+        created_at=current_user.created_at,
+        bio=current_user.bio,
+        profile_image_url=profile_image_url,
+        location=current_user.location,
+        website=current_user.website,
+        phone=current_user.phone,
+    )
+
+
+@app.put("/users/me/profile", response_model=ProfileResponse)
+async def update_my_profile(
+    full_name: Optional[str] = Form(None),
+    bio: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    website: Optional[str] = Form(None),
+    phone: Optional[str] = Form(None),
+    profile_image: Optional[UploadFile] = File(None),
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update profile fields and/or avatar image for the current user."""
+    user = db.query(UserModel).filter(UserModel.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if full_name is not None:
+        user.full_name = full_name
+    if bio is not None:
+        user.bio = bio
+    if location is not None:
+        user.location = location
+    if website is not None:
+        user.website = website
+    if phone is not None:
+        user.phone = phone
+
+    if profile_image:
+        allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+        if profile_image.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image type. Only JPEG, PNG, GIF, and WebP are allowed.",
+            )
+        # Delete old avatar from B2 if it exists
+        if user.profile_image_filename:
+            try:
+                await delete_from_b2(user.profile_image_filename)
+            except Exception as e:
+                logger.warning(f"Could not delete old profile image: {e}")
+        user.profile_image_filename = await upload_to_b2(profile_image, "avatars")
+        logger.info(f"Profile image uploaded for user {user.id}: {user.profile_image_filename}")
+
+    db.commit()
+    db.refresh(user)
+
+    profile_image_url = None
+    if user.profile_image_filename:
+        profile_image_url = f"/b2-proxy/{user.profile_image_filename}"
+
+    logger.info(f"Profile updated for user {user.id}")
+    return ProfileResponse(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        is_active=user.is_active,
+        is_instructor=user.is_instructor,
+        created_at=user.created_at,
+        bio=user.bio,
+        profile_image_url=profile_image_url,
+        location=user.location,
+        website=user.website,
+        phone=user.phone,
+    )
+
+
+@app.delete("/users/me/profile-image")
+async def delete_profile_image(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove the current user's profile image."""
+    user = db.query(UserModel).filter(UserModel.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.profile_image_filename:
+        raise HTTPException(status_code=404, detail="No profile image to delete")
+
+    try:
+        await delete_from_b2(user.profile_image_filename)
+    except Exception as e:
+        logger.warning(f"Could not delete profile image from B2: {e}")
+
+    user.profile_image_filename = None
+    db.commit()
+    return {"message": "Profile image removed successfully"}
 
 
 # ---------------------------------------------------------------------------
