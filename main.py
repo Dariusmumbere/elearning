@@ -74,7 +74,7 @@ PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCY
 PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://pay.pesapal.com/v3")
 PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL", "https://elearning-1-r5di.onrender.com/payments/ipn")
 PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "https://online-coderise.vercel.app/payment/callback")
-COURSE_PRICE_UGX = 20000  # UGX 20,000 per month per course
+COURSE_PRICE_UGX = 50000  # UGX 50,000 per month per course
 
 # In-memory cache for PesaPal token and IPN ID (survives process restarts via env fallback)
 _pesapal_token_cache: dict = {}
