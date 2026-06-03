@@ -94,7 +94,7 @@ except Exception as e:
 quiz_cache = {}
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://elearning_ltdb_user:FD2SwB0zrdhQjFEOPLCHXr9hytKwsaKD@dpg-d7jqsgt7vvec73dq64q0-a/elearning_ltdb")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_cjvA0Qyglx7P@ep-winter-cloud-app1qkm3.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
