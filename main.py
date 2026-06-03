@@ -470,7 +470,13 @@ class QuizAttemptDetailResponse(BaseModel):
     class Config:
         orm_mode = True
 
+class AIConsultRequest(BaseModel):
+    question: str
 
+
+class AIConsultResponse(BaseModel):
+    answer: str
+    
 # Certificate Models
 class CertificateResponse(BaseModel):
     id: int
@@ -3547,6 +3553,95 @@ async def get_quiz_attempt_details(
     }
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD THIS ENDPOINT anywhere after the quiz endpoints in main.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/lessons/{lesson_id}/ai-consult", response_model=AIConsultResponse)
+async def ai_consult(
+    lesson_id: int,
+    request: AIConsultRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Let an enrolled student ask the AI tutor a question about a specific lesson.
+    The lesson content is injected as context so the AI can give deep, relevant answers.
+    Chat history is NOT stored — each request is stateless.
+    """
+    # ── Auth checks ──────────────────────────────────────────────────────────
+    lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == lesson.module.course_id,
+    ).first()
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+
+    # ── Validate question ────────────────────────────────────────────────────
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    if len(question) > 1000:
+        raise HTTPException(status_code=400, detail="Question is too long (max 1000 characters)")
+
+    # ── Build prompt ─────────────────────────────────────────────────────────
+    lesson_context = lesson.content or "No written content available for this lesson."
+
+    system_prompt = f"""You are an expert AI tutor for an online learning platform called CodeRise Academy.
+A student is asking a question about a specific lesson. Your role is to:
+- Explain concepts clearly and in depth
+- Use examples, analogies, and step-by-step breakdowns where helpful
+- Stay focused on the lesson topic but connect to related concepts when useful
+- Be encouraging and supportive
+- Keep answers concise yet thorough (aim for 150–400 words unless the topic demands more)
+
+LESSON TITLE: {lesson.title}
+
+LESSON CONTENT (use this as your primary knowledge source):
+\"\"\"
+{lesson_context[:4000]}
+\"\"\"
+
+Answer the student's question below based on the lesson content above.
+If the question goes beyond the lesson, you may draw on your broader knowledge
+while noting that it extends the lesson material."""
+
+    # ── Call Gemini ──────────────────────────────────────────────────────────
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        logger.error("GEMINI_API_KEY not set — cannot serve AI consultation")
+        raise HTTPException(
+            status_code=503,
+            detail="AI consultation is temporarily unavailable. Please contact support.",
+        )
+
+    try:
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=system_prompt,
+        )
+        response = model.generate_content(question)
+        answer = response.text.strip()
+
+        if not answer:
+            raise ValueError("Empty response from AI model")
+
+        logger.info(f"AI consult: user={current_user.id} lesson={lesson_id} q_len={len(question)}")
+        return AIConsultResponse(answer=answer)
+
+    except Exception as e:
+        logger.error(f"AI consultation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to get AI response. Please try again.",
+        )
 # ---------------------------------------------------------------------------
 # File Upload
 # ---------------------------------------------------------------------------
