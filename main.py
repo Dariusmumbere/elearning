@@ -47,7 +47,7 @@ import math
 import redis
 import pickle
 
-# Set up logging
+# Set logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
