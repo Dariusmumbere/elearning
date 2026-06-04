@@ -3593,7 +3593,7 @@ async def ai_consult(
     # ── Build prompt ─────────────────────────────────────────────────────────
     lesson_context = lesson.content or "No written content available for this lesson."
 
-    system_prompt = f"""You are an expert AI tutor for an online learning platform called CodeRise Academy.
+    system_prompt = f"""You are an expert AI tutor for an online learning platform called ScienceTech Academy.
 A student is asking a question about a specific lesson. Your role is to:
 - Explain concepts clearly and in depth
 - Use examples, analogies, and step-by-step breakdowns where helpful
