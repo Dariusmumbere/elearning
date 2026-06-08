@@ -8,6 +8,8 @@ from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
 from typing import Optional, List, Union
 from jose import JWTError, jwt
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 from passlib.context import CryptContext
 import shutil
 import uuid
