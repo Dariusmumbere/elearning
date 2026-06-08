@@ -523,7 +523,9 @@ class PaymentStatusResponse(BaseModel):
     currency: str
     course_id: int
     created_at: datetime
-
+    
+class GoogleAuthRequest(BaseModel): 
+    credential: str 
 
 # ---------------------------------------------------------------------------
 # Helpers
