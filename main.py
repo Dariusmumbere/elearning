@@ -562,6 +562,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440       # 24 hours
 VIDEO_TOKEN_EXPIRE_MINUTES = 60
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -1644,6 +1645,54 @@ async def initiate_payment(
         order_tracking_id=order_tracking_id,
     )
 
+@app.post("/auth/google", response_model=Token)
+async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
+"""
+Verify a Google ID token and return a JWT access token.
+Creates a new user account if one doesn't exist yet.
+"""
+if not GOOGLE_CLIENT_ID:
+raise HTTPException(status_code=503, detail="Google Sign-In is not configured.")
+
+try:  
+    id_info = id_token.verify_oauth2_token(  
+        payload.credential,  
+        google_requests.Request(),  
+        GOOGLE_CLIENT_ID,  
+    )  
+except ValueError as e:  
+    logger.error(f"Google token verification failed: {e}")  
+    raise HTTPException(status_code=401, detail="Invalid Google token.")  
+
+email = id_info.get("email")  
+full_name = id_info.get("name", email.split("@")[0])  
+
+if not email:  
+    raise HTTPException(status_code=400, detail="Google account has no email address.")  
+
+# Get or create user  
+user = get_user_by_email(db, email)  
+if not user:  
+    # Create account with a random unusable password  
+    random_password = uuid.uuid4().hex  
+    user = UserModel(  
+        email=email,  
+        hashed_password=get_password_hash(random_password),  
+        full_name=full_name,  
+        is_instructor=False,  
+    )  
+    db.add(user)  
+    db.commit()  
+    db.refresh(user)  
+    logger.info(f"New user created via Google Sign-In: {email}")  
+else:  
+    logger.info(f"Existing user signed in via Google: {email}")  
+
+access_token = create_access_token(  
+    data={"sub": user.email},  
+    expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),  
+)  
+return {"access_token": access_token, "token_type": "bearer"}
 
 @app.get("/payments/callback")
 async def payment_callback(
