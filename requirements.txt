@@ -17,3 +17,4 @@ pdfkit
 reportlab
 argon2-cffi
 redis
+google-auth
