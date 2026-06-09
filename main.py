@@ -72,17 +72,20 @@ b2_client = boto3.client(
 # ---------------------------------------------------------------------------
 PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_CONSUMER_KEY", "lGw3V7l9BwOqZKttLM3Z8KcmopU1+tT1")
 PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_CONSUMER_SECRET", "hY5oqA0JGl4MwRCYFjn0y5n9xEs=")
-# Switch to https://pay.pesapal.com/v3 for production
 PESAPAL_BASE_URL = os.getenv("PESAPAL_BASE_URL", "https://pay.pesapal.com/v3")
 PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL", "https://elearning-1-r5di.onrender.com/payments/ipn")
 PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "https://online-coderise.vercel.app/payment/callback")
-COURSE_PRICE_UGX = 25000  # UGX 25,000 per month per course
+COURSE_PRICE_UGX = 25000
 
-# In-memory cache for PesaPal token and IPN ID (survives process restarts via env fallback)
+# Platform branding
+PLATFORM_NAME = "ScienceTech Academy"
+PLATFORM_DOMAIN = "online-coderise.vercel.app"
+PLATFORM_TAGLINE = "Empowering Learners Worldwide"
+
 _pesapal_token_cache: dict = {}
 _pesapal_ipn_id: Optional[str] = None
 
-# Redis configuration for caching quiz questions
+# Redis configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 try:
     redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
@@ -92,7 +95,6 @@ except Exception as e:
     logger.warning(f"Redis connection failed: {e}. Using in-memory cache.")
     redis_client = None
 
-# In-memory cache fallback
 quiz_cache = {}
 
 # Database configuration
@@ -116,7 +118,6 @@ class UserModel(Base):
     is_active = Column(Boolean, default=True)
     is_instructor = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    # --- NEW profile fields ---
     bio = Column(Text, nullable=True)
     profile_image_filename = Column(String, nullable=True)
     location = Column(String, nullable=True)
@@ -236,19 +237,15 @@ class CertificateModel(Base):
 
 
 class PaymentModel(Base):
-    """Tracks PesaPal payment attempts and their status."""
     __tablename__ = "payments"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     course_id = Column(Integer, ForeignKey("courses.id"))
-    # Our unique merchant reference sent to PesaPal
     merchant_reference = Column(String, unique=True, index=True)
-    # PesaPal's tracking ID (returned after SubmitOrderRequest)
     order_tracking_id = Column(String, nullable=True, index=True)
     amount = Column(Integer, default=COURSE_PRICE_UGX)
     currency = Column(String, default="UGX")
-    # PENDING | COMPLETED | FAILED | INVALID
     status = Column(String, default="PENDING")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -257,7 +254,6 @@ class PaymentModel(Base):
     course = relationship("CourseModel", back_populates="payments")
 
 
-# Create tables
 Base.metadata.create_all(bind=engine)
 
 # ---------------------------------------------------------------------------
@@ -289,7 +285,6 @@ class User(UserBase):
         orm_mode = True
 
 
-# --- NEW: Profile update schema ---
 class ProfileUpdate(BaseModel):
     full_name: Optional[str] = None
     bio: Optional[str] = None
@@ -409,7 +404,6 @@ class VideoTokenResponse(BaseModel):
     expires_at: datetime
 
 
-# Quiz Models
 class QuizQuestion(BaseModel):
     question: str
     options: List[str]
@@ -472,14 +466,15 @@ class QuizAttemptDetailResponse(BaseModel):
     class Config:
         orm_mode = True
 
+
 class AIConsultRequest(BaseModel):
     question: str
 
 
 class AIConsultResponse(BaseModel):
     answer: str
-    
-# Certificate Models
+
+
 class CertificateResponse(BaseModel):
     id: int
     user_id: int
@@ -502,13 +497,11 @@ class CertificateEligibilityResponse(BaseModel):
     existing_certificate: Optional[CertificateResponse] = None
 
 
-# New: image URL response model
 class ImageUrlResponse(BaseModel):
     url: str
-    expires_in: int  # seconds
+    expires_in: int
 
 
-# Payment Models
 class PaymentInitiateResponse(BaseModel):
     redirect_url: str
     merchant_reference: str
@@ -523,9 +516,10 @@ class PaymentStatusResponse(BaseModel):
     currency: str
     course_id: int
     created_at: datetime
-    
-class GoogleAuthRequest(BaseModel): 
-    credential: str 
+
+
+class GoogleAuthRequest(BaseModel):
+    credential: str
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -559,17 +553,16 @@ def migrate_has_quiz_default(db: Session):
         raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 
-# Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440       # 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 VIDEO_TOKEN_EXPIRE_MINUTES = 60
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(title="eLearning Platform API")
+app = FastAPI(title="ScienceTech Academy API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -650,7 +643,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
 
 def check_previous_lessons_completed(db: Session, enrollment_id: int, current_lesson: LessonModel):
-    """Check if all previous lessons in the module are completed."""
     all_lessons = (
         db.query(LessonModel)
         .filter(LessonModel.module_id == current_lesson.module_id)
@@ -677,7 +669,6 @@ def check_previous_lessons_completed(db: Session, enrollment_id: int, current_le
 # ---------------------------------------------------------------------------
 
 async def upload_to_b2(file: UploadFile, folder: str) -> str:
-    """Upload a file to Backblaze B2 and return the object key."""
     try:
         file_extension = file.filename.split(".")[-1]
         filename = f"{folder}/{uuid.uuid4()}.{file_extension}"
@@ -696,7 +687,6 @@ async def upload_to_b2(file: UploadFile, folder: str) -> str:
 
 
 async def delete_from_b2(filename: str):
-    """Delete a file from Backblaze B2."""
     try:
         b2_client.delete_object(Bucket=B2_BUCKET_NAME, Key=filename)
         logger.info(f"File deleted from B2: {filename}")
@@ -706,7 +696,6 @@ async def delete_from_b2(filename: str):
 
 
 async def generate_presigned_url(filename: str, expiration: int = 3600) -> Optional[str]:
-    """Generate a presigned URL for a private B2 object."""
     try:
         if not filename:
             return None
@@ -795,10 +784,6 @@ def get_cached_quiz_questions(user_id: int, lesson_id: int, quiz_id: str):
 # ---------------------------------------------------------------------------
 
 def pesapal_get_token() -> str:
-    """
-    Authenticate with PesaPal and return a bearer token.
-    Tokens are cached in memory and reused until they expire.
-    """
     global _pesapal_token_cache
 
     now = datetime.utcnow()
@@ -820,13 +805,10 @@ def pesapal_get_token() -> str:
     }
 
     logger.info(f"Requesting PesaPal token from {auth_url}")
-    logger.debug(f"Auth payload: {payload}")
 
     try:
         resp = requests.post(auth_url, json=payload, headers=headers, timeout=30)
         logger.info(f"PesaPal auth response status: {resp.status_code}")
-        logger.info(f"PesaPal auth response headers: {dict(resp.headers)}")
-        
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"PesaPal auth response body: {json.dumps(data, indent=2)}")
@@ -843,10 +825,8 @@ def pesapal_get_token() -> str:
         logger.error(f"PesaPal auth response missing token: {data}")
         raise HTTPException(status_code=502, detail="Invalid PesaPal authentication response.")
 
-    # Parse expiry; default to 50 minutes from now if not parseable
     try:
         expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).replace(tzinfo=None)
-        # Buffer of 5 minutes
         expiry -= timedelta(minutes=5)
         logger.info(f"PesaPal token expires at {expiry}")
     except Exception as e:
@@ -859,18 +839,12 @@ def pesapal_get_token() -> str:
 
 
 def pesapal_register_ipn(token: str) -> str:
-    """
-    Register the IPN URL with PesaPal and return the ipn_id.
-    Only registers once per process lifetime; subsequent calls return cached ID.
-    """
     global _pesapal_ipn_id
 
-    # Return cached IPN ID if available
     if _pesapal_ipn_id:
         logger.info(f"Using cached IPN ID: {_pesapal_ipn_id}")
         return _pesapal_ipn_id
 
-    # Check env-configured IPN ID (set after first registration)
     env_ipn_id = os.getenv("PESAPAL_IPN_ID")
     if env_ipn_id:
         logger.info(f"Using env-configured IPN ID: {env_ipn_id}")
@@ -889,14 +863,10 @@ def pesapal_register_ipn(token: str) -> str:
     }
 
     logger.info(f"Registering IPN URL: {PESAPAL_IPN_URL}")
-    logger.info(f"IPN registration request to {ipn_url}")
-    logger.debug(f"IPN payload: {payload}")
 
     try:
         resp = requests.post(ipn_url, json=payload, headers=headers, timeout=30)
         logger.info(f"IPN registration response status: {resp.status_code}")
-        logger.info(f"IPN registration response headers: {dict(resp.headers)}")
-        
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"IPN registration response body: {json.dumps(data, indent=2)}")
@@ -928,10 +898,6 @@ def pesapal_submit_order(
     last_name: str,
     callback_url: str,
 ) -> dict:
-    """
-    Submit an order to PesaPal and return the response dict containing
-    order_tracking_id and redirect_url.
-    """
     order_url = f"{PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest"
     payload = {
         "id": merchant_reference,
@@ -962,13 +928,10 @@ def pesapal_submit_order(
 
     logger.info(f"Submitting order to PesaPal: {order_url}")
     logger.info(f"Order payload: {json.dumps(payload, indent=2)}")
-    logger.info(f"Callback URL: {callback_url}")
 
     try:
         resp = requests.post(order_url, json=payload, headers=headers, timeout=30)
         logger.info(f"SubmitOrder response status: {resp.status_code}")
-        logger.info(f"SubmitOrder response headers: {dict(resp.headers)}")
-        
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"SubmitOrder response body (FULL): {json.dumps(data, indent=2)}")
@@ -978,27 +941,17 @@ def pesapal_submit_order(
             logger.error(f"Response body: {e.response.text}")
         raise HTTPException(status_code=502, detail="Could not submit payment order to PesaPal.")
 
-    # -----------------------------------------------------------------------
-    # Robust error handling — data['error'] can be None, a dict, or absent.
-    # -----------------------------------------------------------------------
     error_field = data.get("error")
     if error_field is not None:
-        # error_field could be a dict with a 'message' key, or some other truthy value
         if isinstance(error_field, dict):
             error_message = error_field.get("message") or error_field.get("errorMessage") or str(error_field)
         else:
             error_message = str(error_field)
         logger.error(f"PesaPal order error field: {error_field}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"PesaPal error: {error_message}",
-        )
+        raise HTTPException(status_code=502, detail=f"PesaPal error: {error_message}")
 
-    # Also check for a top-level status indicating failure
-    # PesaPal sometimes returns {"status": "200", ...} on success
     status_val = data.get("status")
     if status_val and str(status_val) not in ("200", "0"):
-        # status "0" sometimes means success in PesaPal v3
         logger.warning(f"PesaPal unexpected status value: {status_val}")
 
     redirect_url = data.get("redirect_url")
@@ -1014,7 +967,6 @@ def pesapal_submit_order(
 
 
 def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
-    """Query PesaPal for the current status of a transaction."""
     status_url = f"{PESAPAL_BASE_URL}/api/Transactions/GetTransactionStatus"
     headers = {
         "Accept": "application/json",
@@ -1023,14 +975,10 @@ def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
     params = {"orderTrackingId": order_tracking_id}
 
     logger.info(f"Querying transaction status for {order_tracking_id}")
-    logger.info(f"Status URL: {status_url}")
-    logger.debug(f"Query params: {params}")
 
     try:
         resp = requests.get(status_url, headers=headers, params=params, timeout=30)
         logger.info(f"Transaction status response status: {resp.status_code}")
-        logger.info(f"Transaction status response headers: {dict(resp.headers)}")
-        
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"Transaction status response body (FULL): {json.dumps(data, indent=2)}")
@@ -1043,7 +991,6 @@ def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
 
 
 def _enroll_user_in_course(db: Session, user_id: int, course_id: int):
-    """Create an enrollment record if one does not already exist."""
     existing = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == user_id,
         EnrollmentModel.course_id == course_id,
@@ -1062,7 +1009,6 @@ def _enroll_user_in_course(db: Session, user_id: int, course_id: int):
 # ---------------------------------------------------------------------------
 
 async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
-    """Generate a quiz using Gemini AI based on lesson content."""
     try:
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
@@ -1086,12 +1032,9 @@ async def generate_quiz(lesson_content: str) -> List[QuizQuestion]:
             ]
         }}
         The correct_answer should be the index (0-3) of the correct option.
-
         IMPORTANT: Make sure the questions are directly related to the content and test actual understanding.
-
         Lesson Content:
         {lesson_content}
-
         Return ONLY valid JSON. Do not include any additional text.
         """
 
@@ -1166,7 +1109,65 @@ def generate_certificate_hash(user_id: int, course_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Modern Certificate PDF
+# QR Code Generation (pure Python, no external library)
+# Fetches a QR code PNG from the Google Charts API and returns raw bytes.
+# Falls back to a drawn placeholder if the fetch fails.
+# ---------------------------------------------------------------------------
+
+def _fetch_qr_png(verify_url: str, size: int = 120) -> Optional[bytes]:
+    """
+    Fetch a QR-code PNG from the Google Charts API.
+    Returns raw PNG bytes or None on failure.
+    """
+    try:
+        encoded = quote(verify_url, safe='')
+        chart_url = (
+            f"https://chart.googleapis.com/chart"
+            f"?cht=qr&chs={size}x{size}&chl={encoded}&choe=UTF-8&chld=M|2"
+        )
+        resp = requests.get(chart_url, timeout=8)
+        if resp.status_code == 200 and resp.content:
+            logger.info(f"QR code fetched successfully ({len(resp.content)} bytes)")
+            return resp.content
+    except Exception as e:
+        logger.warning(f"QR code fetch failed: {e}")
+    return None
+
+
+class _QRPlaceholder(Flowable):
+    """
+    Fallback: draws a simple bordered square with 'SCAN TO VERIFY' text
+    when the QR image cannot be fetched.
+    """
+    def __init__(self, size_pt: float, url: str):
+        super().__init__()
+        self.size_pt = size_pt
+        self.url = url
+        self.width = size_pt
+        self.height = size_pt
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.setFillColor(colors.white)
+        c.setStrokeColor(colors.HexColor('#C9A84C'))
+        c.setLineWidth(1.5)
+        c.rect(0, 0, self.size_pt, self.size_pt, fill=1, stroke=1)
+
+        c.setFillColor(colors.HexColor('#0B1A2E'))
+        c.setFont("Helvetica-Bold", 6)
+        c.drawCentredString(self.size_pt / 2, self.size_pt * 0.55, "SCAN TO VERIFY")
+        c.setFont("Helvetica", 5)
+        c.drawCentredString(self.size_pt / 2, self.size_pt * 0.42, "QR code unavailable")
+        c.setFont("Helvetica", 4)
+        # Show short hash as fallback text
+        short = self.url.split("/")[-1][:16] if "/" in self.url else self.url[:16]
+        c.drawCentredString(self.size_pt / 2, self.size_pt * 0.28, short.upper())
+        c.restoreState()
+
+
+# ---------------------------------------------------------------------------
+# Modern Certificate PDF — ScienceTech Academy
 # ---------------------------------------------------------------------------
 
 class _HRule(Flowable):
@@ -1187,43 +1188,41 @@ class _HRule(Flowable):
 def _draw_certificate_background(canvas, doc):
     """Draw the decorative page background, borders, and watermark elements."""
     canvas.saveState()
-    W, H = A4  # 595.27 x 841.89 pts
+    W, H = A4
 
-    # ── Deep navy background ──────────────────────────────────────────────
+    # Deep navy background
     canvas.setFillColor(colors.HexColor('#0B1A2E'))
     canvas.rect(0, 0, W, H, fill=1, stroke=0)
 
-    # ── Top gold band ─────────────────────────────────────────────────────
+    # Top gold band
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, H - 58, W, 58, fill=1, stroke=0)
 
-    # ── Bottom gold band ──────────────────────────────────────────────────
+    # Bottom gold band
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, 0, W, 58, fill=1, stroke=0)
 
-    # ── Thin white accent lines just inside the bands ─────────────────────
+    # Thin white accent lines just inside the bands
     canvas.setStrokeColor(colors.white)
     canvas.setLineWidth(1)
     canvas.line(0, H - 62, W, H - 62)
     canvas.line(0, 62, W, 62)
 
-    # ── Side accent bars (narrow gold) ────────────────────────────────────
+    # Side accent bars
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, 58, 14, H - 116, fill=1, stroke=0)
     canvas.rect(W - 14, 58, 14, H - 116, fill=1, stroke=0)
 
-    # ── Inner white accent lines beside the side bars ─────────────────────
+    # Inner white accent lines beside the side bars
     canvas.setStrokeColor(colors.HexColor('#FFFFFF'))
     canvas.setLineWidth(0.5)
     canvas.line(18, 62, 18, H - 62)
     canvas.line(W - 18, 62, W - 18, H - 62)
 
-    # ── Decorative corner diamonds (top-left, top-right, bottom-left, bottom-right)
+    # Decorative corner diamonds
     gold = colors.HexColor('#C9A84C')
-    white = colors.white
     corners = [(14, H - 58), (W - 14, H - 58), (14, 58), (W - 14, 58)]
     for cx, cy in corners:
-        # Outer diamond
         canvas.setFillColor(colors.HexColor('#0B1A2E'))
         canvas.setStrokeColor(gold)
         canvas.setLineWidth(1.5)
@@ -1235,11 +1234,10 @@ def _draw_certificate_background(canvas, doc):
         p.lineTo(cx - size, cy)
         p.close()
         canvas.drawPath(p, fill=1, stroke=1)
-        # Inner dot
         canvas.setFillColor(gold)
         canvas.circle(cx, cy, 3, fill=1, stroke=0)
 
-    # ── Watermark seal (large faint circle in centre) ─────────────────────
+    # Watermark seal (large faint circle in centre)
     canvas.setStrokeColor(colors.HexColor('#1A2E4A'))
     canvas.setLineWidth(1)
     cx, cy = W / 2, H / 2
@@ -1257,27 +1255,26 @@ def _draw_certificate_background(canvas, doc):
         y2 = cy + 120 * math.sin(angle)
         canvas.line(x1, y1, x2, y2)
 
-    # ── Platform name in gold inside the bands ────────────────────────────
+    # Platform name in gold band — ScienceTech Academy
     canvas.setFillColor(colors.HexColor('#0B1A2E'))
     canvas.setFont("Helvetica-Bold", 13)
-    canvas.drawCentredString(W / 2, H - 38, "C O D E R I S E   A C A D E M Y")
+    canvas.drawCentredString(W / 2, H - 38, "S C I E N C E T E C H   A C A D E M Y")
 
     canvas.setFillColor(colors.HexColor('#0B1A2E'))
     canvas.setFont("Helvetica", 9)
-    canvas.drawCentredString(W / 2, 22, "online-coderise.vercel.app  ·  Empowering Learners Worldwide")
+    canvas.drawCentredString(W / 2, 22, f"{PLATFORM_DOMAIN}  ·  {PLATFORM_TAGLINE}")
 
     canvas.restoreState()
 
 
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
-    """Create a modern, premium certificate PDF."""
+    """Create a premium certificate PDF for ScienceTech Academy with a scannable QR code."""
     buffer = BytesIO()
 
-    # Page margins: inside the decorative side bars (14 pt) + padding
     left_margin = 38
     right_margin = 38
-    top_margin = 72      # clear the top gold band (58) + a bit
-    bottom_margin = 72   # clear the bottom gold band
+    top_margin = 72
+    bottom_margin = 72
 
     doc = SimpleDocTemplate(
         buffer,
@@ -1289,17 +1286,17 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     )
 
     W, H = A4
-    usable_width = W - left_margin - right_margin   # ~519 pt
+    usable_width = W - left_margin - right_margin
 
-    # ── Colour palette ────────────────────────────────────────────────────
-    GOLD      = colors.HexColor('#C9A84C')
+    # Colour palette
+    GOLD       = colors.HexColor('#C9A84C')
     LIGHT_GOLD = colors.HexColor('#E8D5A3')
-    WHITE     = colors.white
+    WHITE      = colors.white
     LIGHT_BLUE = colors.HexColor('#A8C8E8')
-    SILVER    = colors.HexColor('#C0C0C0')
+    SILVER     = colors.HexColor('#C0C0C0')
 
-    # ── Paragraph styles ──────────────────────────────────────────────────
-    def _style(name, font='Helvetica', size=12, color=WHITE, space_before=0, space_after=8, align=TA_CENTER, leading=None):
+    def _style(name, font='Helvetica', size=12, color=WHITE, space_before=0,
+               space_after=8, align=TA_CENTER, leading=None):
         return ParagraphStyle(
             name,
             fontName=font,
@@ -1311,18 +1308,18 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
             leading=leading or size * 1.2,
         )
 
-    style_eyebrow  = _style('eyebrow',  'Helvetica',      9,  LIGHT_GOLD,   0,  4,  TA_CENTER)
-    style_big_title= _style('bigtitle', 'Helvetica-Bold', 30, GOLD,         0, 10,  TA_CENTER, 34)
-    style_subtitle = _style('subtitle', 'Helvetica',      11, LIGHT_BLUE,   0,  6,  TA_CENTER)
-    style_present  = _style('present',  'Helvetica',      11, SILVER,       6,  4,  TA_CENTER)
-    style_name     = _style('name',     'Helvetica-Bold', 28, WHITE,        4, 10,  TA_CENTER, 32)
-    style_for_comp = _style('forcomp',  'Helvetica',      10, SILVER,       0,  4,  TA_CENTER)
-    style_course   = _style('course',   'Helvetica-Bold', 18, GOLD,         4, 10,  TA_CENTER, 22)
-    style_body     = _style('body',     'Helvetica',      10, SILVER,       4,  4,  TA_CENTER)
-    style_date     = _style('date',     'Helvetica',      10, LIGHT_GOLD,   2,  2,  TA_CENTER)
-    style_hash     = _style('hash',     'Helvetica',       7, colors.HexColor('#5A7A9A'), 8, 0, TA_CENTER)
-    style_sig_name = _style('signame',  'Helvetica-Bold', 10, WHITE,        2,  0,  TA_CENTER)
-    style_sig_role = _style('sigrole',  'Helvetica',       8, SILVER,       0,  0,  TA_CENTER)
+    style_eyebrow   = _style('eyebrow',   'Helvetica',      9,  LIGHT_GOLD,   0,  4)
+    style_big_title = _style('bigtitle',  'Helvetica-Bold', 28, GOLD,         0, 10, leading=32)
+    style_present   = _style('present',   'Helvetica',      11, SILVER,       6,  4)
+    style_name      = _style('name',      'Helvetica-Bold', 26, WHITE,        4, 10, leading=30)
+    style_for_comp  = _style('forcomp',   'Helvetica',      10, SILVER,       0,  4)
+    style_course    = _style('course',    'Helvetica-Bold', 17, GOLD,         4, 10, leading=21)
+    style_body      = _style('body',      'Helvetica',      10, SILVER,       4,  4)
+    style_date      = _style('date',      'Helvetica',      10, LIGHT_GOLD,   2,  2)
+    style_hash      = _style('hash',      'Helvetica',       7, colors.HexColor('#5A7A9A'), 8, 0)
+    style_sig_name  = _style('signame',   'Helvetica-Bold', 10, WHITE,        2,  0)
+    style_sig_role  = _style('sigrole',   'Helvetica',       8, SILVER,       0,  0)
+    style_qr_label  = _style('qrlabel',   'Helvetica',       7, LIGHT_GOLD,   4,  0)
 
     elements = []
 
@@ -1335,8 +1332,8 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
         if logo_resp.status_code == 200:
             logo_img = Image(BytesIO(logo_resp.content))
             aspect = logo_img.imageWidth / logo_img.imageHeight
-            logo_img.drawWidth  = 0.7 * inch
-            logo_img.drawHeight = 0.7 * inch / aspect
+            logo_img.drawWidth  = 0.65 * inch
+            logo_img.drawHeight = 0.65 * inch / aspect
             logo_img.hAlign = 'CENTER'
             elements.append(logo_img)
             elements.append(Spacer(1, 6))
@@ -1344,119 +1341,138 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
         logger.warning(f"Could not load logo for certificate: {e}")
 
     # ── Eye-brow text ─────────────────────────────────────────────────────
-    elements.append(Paragraph("— OFFICIAL CERTIFICATE —", style_eyebrow))
+    elements.append(Paragraph("— OFFICIAL CERTIFICATE OF ACHIEVEMENT —", style_eyebrow))
     elements.append(Spacer(1, 4))
 
     # ── Main title ────────────────────────────────────────────────────────
-    elements.append(Paragraph("Certificate of Achievement", style_big_title))
+    elements.append(Paragraph("ScienceTech Academy", style_big_title))
 
-    # ── Gold divider ──────────────────────────────────────────────────────
     elements.append(Spacer(1, 6))
     elements.append(_HRule(usable_width, thickness=2, color=GOLD))
     elements.append(Spacer(1, 2))
     elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 10))
 
-    # ── Subtitle ──────────────────────────────────────────────────────────
     elements.append(Paragraph("This is to proudly certify that", style_present))
-    elements.append(Spacer(1, 8))
+    elements.append(Spacer(1, 6))
 
-    # ── Recipient name in a styled box ───────────────────────────────────
+    # ── Recipient name ────────────────────────────────────────────────────
     name_table = Table(
         [[Paragraph(user.full_name, style_name)]],
         colWidths=[usable_width],
     )
     name_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#102040')),
-        ('BOX',        (0, 0), (-1, -1), 1.5, GOLD),
-        ('LEFTPADDING',  (0, 0), (-1, -1), 18),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 18),
-        ('TOPPADDING',   (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING',(0, 0), (-1, -1), 10),
-        ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+        ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor('#102040')),
+        ('BOX',           (0, 0), (-1, -1), 1.5, GOLD),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 18),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 18),
+        ('TOPPADDING',    (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     elements.append(name_table)
-    elements.append(Spacer(1, 14))
+    elements.append(Spacer(1, 12))
 
-    # ── Completion line ───────────────────────────────────────────────────
     elements.append(Paragraph("has successfully completed all requirements for the course", style_for_comp))
-    elements.append(Spacer(1, 8))
+    elements.append(Spacer(1, 6))
 
-    # ── Course title in gold accent box ───────────────────────────────────
+    # ── Course title ──────────────────────────────────────────────────────
     course_table = Table(
         [[Paragraph(course.title, style_course)]],
         colWidths=[usable_width],
     )
     course_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#0D2240')),
-        ('BOX',        (0, 0), (-1, -1), 0.75, LIGHT_GOLD),
-        ('LINEBELOW',  (0, 0), (-1, -1), 3, GOLD),
-        ('LEFTPADDING',  (0, 0), (-1, -1), 24),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 24),
-        ('TOPPADDING',   (0, 0), (-1, -1), 12),
-        ('BOTTOMPADDING',(0, 0), (-1, -1), 12),
-        ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+        ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor('#0D2240')),
+        ('BOX',           (0, 0), (-1, -1), 0.75, LIGHT_GOLD),
+        ('LINEBELOW',     (0, 0), (-1, -1), 3, GOLD),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 24),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 24),
+        ('TOPPADDING',    (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     elements.append(course_table)
-    elements.append(Spacer(1, 14))
+    elements.append(Spacer(1, 10))
 
-    # ── Body copy ─────────────────────────────────────────────────────────
     elements.append(Paragraph(
         "demonstrating dedication, commitment, and mastery of the curriculum.",
         style_body
     ))
-    elements.append(Spacer(1, 4))
 
-    # ── Issue date ────────────────────────────────────────────────────────
     completion_date = datetime.utcnow().strftime("%B %d, %Y")
     elements.append(Paragraph(f"Issued on  {completion_date}", style_date))
-    elements.append(Spacer(1, 16))
+    elements.append(Spacer(1, 12))
 
-    # ── Second divider ────────────────────────────────────────────────────
     elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
     elements.append(Spacer(1, 2))
     elements.append(_HRule(usable_width, thickness=2, color=GOLD))
-    elements.append(Spacer(1, 18))
+    elements.append(Spacer(1, 14))
 
-    # ── Signature row ─────────────────────────────────────────────────────
-    col = usable_width / 3
+    # ── Signature row + QR code side by side ─────────────────────────────
+    verify_url = f"https://{PLATFORM_DOMAIN}/verify/{certificate_hash}"
+
+    # Fetch QR code image
+    qr_png_bytes = _fetch_qr_png(verify_url, size=130)
+    qr_size_pt = 1.2 * inch  # 86.4 pt
+
+    if qr_png_bytes:
+        qr_img = Image(BytesIO(qr_png_bytes))
+        qr_img.drawWidth  = qr_size_pt
+        qr_img.drawHeight = qr_size_pt
+        qr_img.hAlign = 'CENTER'
+        qr_cell = [
+            qr_img,
+            Paragraph("Scan to verify", style_qr_label),
+        ]
+    else:
+        qr_cell = [
+            _QRPlaceholder(qr_size_pt, verify_url),
+            Paragraph("Scan to verify", style_qr_label),
+        ]
 
     def _sig_cell(name, role):
         return [
-            Paragraph("______________________", _style('sigline', 'Helvetica', 10, SILVER, 0, 2, TA_CENTER)),
+            Paragraph("______________________", _style('sigline', 'Helvetica', 10, SILVER, 0, 2)),
             Paragraph(name, style_sig_name),
             Paragraph(role, style_sig_role),
         ]
 
+    sig_col_w = (usable_width - qr_size_pt - 12) / 3
+
     sig_data = [[
         _sig_cell("Course Instructor", "Lead Instructor"),
-        _sig_cell("CodeRise Academy", "Issuing Authority"),
+        _sig_cell("ScienceTech Academy", "Issuing Authority"),
         _sig_cell("Academic Director", "Platform Director"),
+        qr_cell,
     ]]
-    sig_table = Table(sig_data, colWidths=[col, col, col])
+    sig_table = Table(sig_data, colWidths=[sig_col_w, sig_col_w, sig_col_w, qr_size_pt + 12])
     sig_table.setStyle(TableStyle([
-        ('ALIGN',   (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN',  (0, 0), (-1, -1), 'TOP'),
-        ('LEFTPADDING',  (0, 0), (-1, -1), 4),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ('ALIGN',          (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',         (0, 0), (2, 0),   'TOP'),
+        ('VALIGN',         (3, 0), (3, 0),   'MIDDLE'),
+        ('LEFTPADDING',    (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING',   (0, 0), (-1, -1), 4),
     ]))
     elements.append(sig_table)
-    elements.append(Spacer(1, 16))
+    elements.append(Spacer(1, 12))
 
     # ── Certificate ID footer ─────────────────────────────────────────────
     id_table = Table(
-        [[Paragraph(f"Certificate ID: {certificate_hash.upper()}  ·  Verify at online-coderise.vercel.app/verify", style_hash)]],
+        [[Paragraph(
+            f"Certificate ID: {certificate_hash.upper()}  ·  Verify at {PLATFORM_DOMAIN}/verify/{certificate_hash}",
+            style_hash
+        )]],
         colWidths=[usable_width],
     )
     id_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#061220')),
-        ('BOX',        (0, 0), (-1, -1), 0.5, colors.HexColor('#1E3A5A')),
-        ('TOPPADDING',   (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING',(0, 0), (-1, -1), 6),
-        ('LEFTPADDING',  (0, 0), (-1, -1), 10),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+        ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor('#061220')),
+        ('BOX',           (0, 0), (-1, -1), 0.5, colors.HexColor('#1E3A5A')),
+        ('TOPPADDING',    (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
     ]))
     elements.append(id_table)
 
@@ -1525,482 +1541,103 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# PesaPal Payment Routes
+# Auth Routes
 # ---------------------------------------------------------------------------
 
-@app.post("/payments/initiate/{course_id}", response_model=PaymentInitiateResponse)
-async def initiate_payment(
-    course_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+@app.post("/token", response_model=Token)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
 ):
-    """
-    Initiate a PesaPal payment for a course enrollment.
-    Returns the PesaPal redirect URL where the user completes payment.
-    """
-    logger.info(f"=== PAYMENT INITIATION START ===")
-    logger.info(f"Course ID: {course_id}, User: {current_user.email} (ID: {current_user.id})")
-    
-    # Verify course exists and is published
-    course = db.query(CourseModel).filter(
-        CourseModel.id == course_id,
-        CourseModel.is_published == True,
-    ).first()
-    if not course:
-        logger.error(f"Course {course_id} not found or not published")
-        raise HTTPException(status_code=404, detail="Course not found.")
-
-    logger.info(f"Course found: {course.title}")
-
-    # Check if user is already enrolled
-    existing_enrollment = db.query(EnrollmentModel).filter(
-        EnrollmentModel.user_id == current_user.id,
-        EnrollmentModel.course_id == course_id,
-    ).first()
-    if existing_enrollment:
-        logger.warning(f"User {current_user.id} already enrolled in course {course_id}")
-        raise HTTPException(status_code=400, detail="You are already enrolled in this course.")
-
-    # Check for a pending/completed payment that hasn't been applied yet
-    existing_completed_payment = db.query(PaymentModel).filter(
-        PaymentModel.user_id == current_user.id,
-        PaymentModel.course_id == course_id,
-        PaymentModel.status == "COMPLETED",
-    ).first()
-    if existing_completed_payment:
-        logger.info(f"Found completed payment for user {current_user.id}, course {course_id}. Applying enrollment.")
-        _enroll_user_in_course(db, current_user.id, course_id)
+    logger.info(f"Login attempt for user: {form_data.username}")
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
         raise HTTPException(
-            status_code=400,
-            detail="Payment already completed. You have been enrolled in the course."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
+    logger.info(f"Successful login for user: {form_data.username}")
+    return {"access_token": access_token, "token_type": "bearer"}
 
-    # Generate a unique merchant reference (max 50 chars, alphanumeric + dash)
-    merchant_reference = f"crs-{course_id}-usr-{current_user.id}-{uuid.uuid4().hex[:8]}"
-    logger.info(f"Generated merchant reference: {merchant_reference}")
 
-    # Authenticate with PesaPal
-    logger.info("Getting PesaPal token...")
-    pesapal_token = pesapal_get_token()
-    logger.info("PesaPal token obtained successfully")
-
-    # Register IPN (idempotent — cached after first registration)
-    logger.info("Registering IPN...")
-    ipn_id = pesapal_register_ipn(pesapal_token)
-    logger.info(f"IPN registered with ID: {ipn_id}")
-
-    # Build the callback URL with merchant reference so we can identify on return
-    callback_url = f"{PESAPAL_CALLBACK_URL}?merchant_reference={merchant_reference}"
-    logger.info(f"Callback URL: {callback_url}")
-
-    # Split full name for billing address
-    name_parts = current_user.full_name.strip().split(" ", 1)
-    first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else ""
-    logger.info(f"Billing info: Name={first_name} {last_name}, Email={current_user.email}")
-
-    # Submit order to PesaPal
-    logger.info("Submitting order to PesaPal...")
-    order_data = pesapal_submit_order(
-        token=pesapal_token,
-        ipn_id=ipn_id,
-        merchant_reference=merchant_reference,
-        amount=COURSE_PRICE_UGX,
-        currency="UGX",
-        description=f"Enrollment: {course.title}"[:100],
-        email=current_user.email,
-        first_name=first_name,
-        last_name=last_name,
-        callback_url=callback_url,
+@app.post("/users/", response_model=User)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    logger.info(f"Creating new user: {user.email}")
+    db_user = get_user_by_email(db, email=user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = get_password_hash(user.password)
+    db_user = UserModel(
+        email=user.email,
+        hashed_password=hashed_password,
+        full_name=user.full_name,
+        is_instructor=user.is_instructor,
     )
-
-    order_tracking_id = order_data.get("order_tracking_id")
-    redirect_url = order_data.get("redirect_url")
-
-    logger.info(f"Order submitted. Tracking ID: {order_tracking_id}")
-    logger.info(f"Redirect URL: {redirect_url}")
-
-    if not redirect_url:
-        logger.error(f"PesaPal response missing redirect_url: {order_data}")
-        raise HTTPException(status_code=502, detail="PesaPal did not return a payment URL.")
-
-    # Persist payment record
-    payment = PaymentModel(
-        user_id=current_user.id,
-        course_id=course_id,
-        merchant_reference=merchant_reference,
-        order_tracking_id=order_tracking_id,
-        amount=COURSE_PRICE_UGX,
-        currency="UGX",
-        status="PENDING",
-    )
-    db.add(payment)
+    db.add(db_user)
     db.commit()
-    db.refresh(payment)
-    logger.info(f"Payment record created with ID: {payment.id}")
+    db.refresh(db_user)
+    logger.info(f"User created successfully: {user.email}")
+    return db_user
 
-    logger.info(f"=== PAYMENT INITIATION COMPLETE ===")
 
-    return PaymentInitiateResponse(
-        redirect_url=redirect_url,
-        merchant_reference=merchant_reference,
-        order_tracking_id=order_tracking_id,
-    )
+@app.get("/users/me/", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    return current_user
+
 
 @app.post("/auth/google", response_model=Token)
 async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
-"""
-Verify a Google ID token and return a JWT access token.
-Creates a new user account if one doesn't exist yet.
-"""
-if not GOOGLE_CLIENT_ID:
-raise HTTPException(status_code=503, detail="Google Sign-In is not configured.")
-
-try:  
-    id_info = id_token.verify_oauth2_token(  
-        payload.credential,  
-        google_requests.Request(),  
-        GOOGLE_CLIENT_ID,  
-    )  
-except ValueError as e:  
-    logger.error(f"Google token verification failed: {e}")  
-    raise HTTPException(status_code=401, detail="Invalid Google token.")  
-
-email = id_info.get("email")  
-full_name = id_info.get("name", email.split("@")[0])  
-
-if not email:  
-    raise HTTPException(status_code=400, detail="Google account has no email address.")  
-
-# Get or create user  
-user = get_user_by_email(db, email)  
-if not user:  
-    # Create account with a random unusable password  
-    random_password = uuid.uuid4().hex  
-    user = UserModel(  
-        email=email,  
-        hashed_password=get_password_hash(random_password),  
-        full_name=full_name,  
-        is_instructor=False,  
-    )  
-    db.add(user)  
-    db.commit()  
-    db.refresh(user)  
-    logger.info(f"New user created via Google Sign-In: {email}")  
-else:  
-    logger.info(f"Existing user signed in via Google: {email}")  
-
-access_token = create_access_token(  
-    data={"sub": user.email},  
-    expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),  
-)  
-return {"access_token": access_token, "token_type": "bearer"}
-
-@app.get("/payments/callback")
-async def payment_callback(
-    request: Request,
-    db: Session = Depends(get_db),
-):
     """
-    Handles the redirect back from PesaPal after the user completes or cancels payment.
-    PesaPal appends orderTrackingId and merchant_reference as query params.
-    This endpoint verifies the payment status and enrolls the user if successful.
-    Redirects the user to the frontend with the result.
+    Verify a Google ID token and return a JWT access token.
+    Creates a new user account if one doesn't exist yet.
     """
-    logger.info(f"=== PAYMENT CALLBACK RECEIVED ===")
-    
-    # Log ALL request details
-    logger.info(f"Callback URL: {request.url}")
-    logger.info(f"Callback method: {request.method}")
-    logger.info(f"Callback headers: {dict(request.headers)}")
-    
-    params = dict(request.query_params)
-    logger.info(f"Callback query parameters (FULL): {json.dumps(params, indent=2)}")
-    
-    order_tracking_id = params.get("OrderTrackingId") or params.get("orderTrackingId")
-    merchant_reference = params.get("OrderMerchantReference") or params.get("merchant_reference")
-    
-    logger.info(f"Extracted - Tracking ID: {order_tracking_id}")
-    logger.info(f"Extracted - Merchant Reference: {merchant_reference}")
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google Sign-In is not configured.")
 
-    if not merchant_reference:
-        logger.error("No merchant_reference found in callback query params")
-        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Missing+payment+reference"
-        logger.info(f"Redirecting to: {redirect_url}")
-        return RedirectResponse(url=redirect_url, status_code=302)
-
-    # Lookup payment record
-    payment = db.query(PaymentModel).filter(
-        PaymentModel.merchant_reference == merchant_reference
-    ).first()
-
-    if not payment:
-        logger.error(f"No payment found for merchant_reference: {merchant_reference}")
-        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Payment+not+found"
-        return RedirectResponse(url=redirect_url, status_code=302)
-
-    logger.info(f"Found payment record: ID={payment.id}, status={payment.status}")
-
-    # Update order_tracking_id if we didn't have it yet
-    if order_tracking_id and not payment.order_tracking_id:
-        logger.info(f"Updating payment record with tracking ID: {order_tracking_id}")
-        payment.order_tracking_id = order_tracking_id
-        db.commit()
-
-    tracking_id = payment.order_tracking_id or order_tracking_id
-    logger.info(f"Using tracking ID: {tracking_id}")
-
-    if not tracking_id:
-        logger.warning(f"No tracking ID available for payment {payment.id}")
-        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
-        return RedirectResponse(url=redirect_url, status_code=302)
-
-    # Query PesaPal for actual transaction status
     try:
-        logger.info(f"Querying transaction status from PesaPal for tracking ID: {tracking_id}")
-        pesapal_token = pesapal_get_token()
-        status_data = pesapal_get_transaction_status(pesapal_token, tracking_id)
-        
-        payment_status_code = status_data.get("payment_status_description", "").upper()
-        pesapal_status = status_data.get("status_code")  # 1=COMPLETED, 0=INVALID, 2=FAILED, etc.
-        
-        logger.info(f"PesaPal payment_status_description: {payment_status_code}")
-        logger.info(f"PesaPal status_code: {pesapal_status}")
-        logger.info(f"Full status data: {json.dumps(status_data, indent=2)}")
+        id_info = id_token.verify_oauth2_token(
+            payload.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        logger.error(f"Google token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Google token.")
 
-        if payment_status_code == "COMPLETED" or pesapal_status == 1:
-            logger.info(f"Payment {merchant_reference} is COMPLETED!")
-            payment.status = "COMPLETED"
-            db.commit()
-            # Enroll the user
-            _enroll_user_in_course(db, payment.user_id, payment.course_id)
-            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=success&course_id={payment.course_id}"
-            logger.info(f"Redirecting to: {redirect_url}")
-            return RedirectResponse(url=redirect_url, status_code=302)
-            
-        elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
-            logger.warning(f"Payment {merchant_reference} FAILED/INVALID")
-            payment.status = "FAILED"
-            db.commit()
-            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=failed&course_id={payment.course_id}"
-            logger.info(f"Redirecting to: {redirect_url}")
-            return RedirectResponse(url=redirect_url, status_code=302)
-        else:
-            logger.info(f"Payment {merchant_reference} status: {payment_status_code} - PENDING")
-            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
-            return RedirectResponse(url=redirect_url, status_code=302)
+    email = id_info.get("email")
+    full_name = id_info.get("name", email.split("@")[0])
 
-    except Exception as e:
-        logger.error(f"Error verifying payment on callback: {e}", exc_info=True)
-        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
-        return RedirectResponse(url=redirect_url, status_code=302)
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account has no email address.")
 
-
-@app.get("/payments/ipn")
-async def payment_ipn(
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    """
-    Instant Payment Notification (IPN) endpoint.
-    PesaPal calls this endpoint (GET) whenever a payment status changes.
-    We query PesaPal for the latest status and update our records.
-    """
-    logger.info(f"=== IPN RECEIVED ===")
-    
-    # Log ALL request details
-    logger.info(f"IPN URL: {request.url}")
-    logger.info(f"IPN method: {request.method}")
-    logger.info(f"IPN headers: {dict(request.headers)}")
-    
-    params = dict(request.query_params)
-    logger.info(f"IPN query parameters (FULL): {json.dumps(params, indent=2)}")
-    
-    order_tracking_id = params.get("orderTrackingId") or params.get("OrderTrackingId")
-    merchant_reference = params.get("orderMerchantReference") or params.get("OrderMerchantReference")
-    order_notification_type = params.get("orderNotificationType")
-    
-    logger.info(f"IPN - orderTrackingId: {order_tracking_id}")
-    logger.info(f"IPN - merchant_reference: {merchant_reference}")
-    logger.info(f"IPN - orderNotificationType: {order_notification_type}")
-
-    if not order_tracking_id:
-        logger.warning("IPN received without orderTrackingId")
-        return {"status": "ignored", "reason": "missing orderTrackingId"}
-
-    # Lookup by tracking ID or merchant reference
-    payment = None
-    if merchant_reference:
-        logger.info(f"Looking up payment by merchant_reference: {merchant_reference}")
-        payment = db.query(PaymentModel).filter(
-            PaymentModel.merchant_reference == merchant_reference
-        ).first()
-        
-    if not payment and order_tracking_id:
-        logger.info(f"Looking up payment by order_tracking_id: {order_tracking_id}")
-        payment = db.query(PaymentModel).filter(
-            PaymentModel.order_tracking_id == order_tracking_id
-        ).first()
-
-    if not payment:
-        logger.warning(f"IPN: No payment found for tracking={order_tracking_id} ref={merchant_reference}")
-        return {"status": "ignored", "reason": "payment not found"}
-
-    logger.info(f"Found payment record: ID={payment.id}, current_status={payment.status}")
-
-    # Update tracking ID if needed
-    if order_tracking_id and not payment.order_tracking_id:
-        logger.info(f"Updating payment with tracking ID: {order_tracking_id}")
-        payment.order_tracking_id = order_tracking_id
+    # Get or create user
+    user = get_user_by_email(db, email)
+    if not user:
+        random_password = uuid.uuid4().hex
+        user = UserModel(
+            email=email,
+            hashed_password=get_password_hash(random_password),
+            full_name=full_name,
+            is_instructor=False,
+        )
+        db.add(user)
         db.commit()
+        db.refresh(user)
+        logger.info(f"New user created via Google Sign-In: {email}")
+    else:
+        logger.info(f"Existing user signed in via Google: {email}")
 
-    # Query PesaPal for definitive status
-    try:
-        logger.info(f"Querying PesaPal for transaction status: {order_tracking_id}")
-        pesapal_token = pesapal_get_token()
-        status_data = pesapal_get_transaction_status(pesapal_token, order_tracking_id)
-        
-        payment_status_code = status_data.get("payment_status_description", "").upper()
-        pesapal_status = status_data.get("status_code")
-        
-        logger.info(f"IPN status - payment_status_description: {payment_status_code}")
-        logger.info(f"IPN status - status_code: {pesapal_status}")
-        logger.info(f"IPN full response: {json.dumps(status_data, indent=2)}")
-
-        if payment_status_code == "COMPLETED" or pesapal_status == 1:
-            if payment.status != "COMPLETED":
-                logger.info(f"IPN: Marking payment {payment.merchant_reference} as COMPLETED")
-                payment.status = "COMPLETED"
-                payment.updated_at = datetime.utcnow()
-                db.commit()
-                _enroll_user_in_course(db, payment.user_id, payment.course_id)
-                logger.info(f"IPN: User {payment.user_id} enrolled in course {payment.course_id}")
-            else:
-                logger.info(f"IPN: Payment already marked as COMPLETED")
-                
-        elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
-            if payment.status != "FAILED":
-                logger.warning(f"IPN: Marking payment {payment.merchant_reference} as FAILED")
-                payment.status = "FAILED"
-                payment.updated_at = datetime.utcnow()
-                db.commit()
-                logger.info(f"IPN: Payment marked FAILED")
-            else:
-                logger.info(f"IPN: Payment already marked as FAILED")
-        else:
-            logger.info(f"IPN: Payment status unchanged: {payment_status_code}")
-
-    except Exception as e:
-        logger.error(f"IPN processing error: {e}", exc_info=True)
-
-    # PesaPal expects a 200 OK with the orderNotificationType echoed back
-    response_data = {
-        "orderNotificationType": order_notification_type, 
-        "orderTrackingId": order_tracking_id, 
-        "orderMerchantReference": merchant_reference
-    }
-    logger.info(f"IPN response: {json.dumps(response_data)}")
-    return response_data
-
-
-@app.get("/payments/verify/{merchant_reference}", response_model=PaymentStatusResponse)
-async def verify_payment(
-    merchant_reference: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Allows the frontend to poll payment status after returning from PesaPal.
-    If payment is COMPLETED, also triggers enrollment (safety net).
-    """
-    logger.info(f"=== PAYMENT VERIFICATION ===")
-    logger.info(f"Merchant reference: {merchant_reference}, User: {current_user.id}")
-
-    payment = db.query(PaymentModel).filter(
-        PaymentModel.merchant_reference == merchant_reference,
-        PaymentModel.user_id == current_user.id,
-    ).first()
-
-    if not payment:
-        logger.error(f"Payment record not found for ref: {merchant_reference}")
-        raise HTTPException(status_code=404, detail="Payment record not found.")
-
-    logger.info(f"Payment found: status={payment.status}, tracking_id={payment.order_tracking_id}")
-
-    # If still pending, re-query PesaPal for latest status
-    if payment.status == "PENDING" and payment.order_tracking_id:
-        logger.info(f"Payment still pending, querying PesaPal for status...")
-        try:
-            pesapal_token = pesapal_get_token()
-            status_data = pesapal_get_transaction_status(pesapal_token, payment.order_tracking_id)
-            
-            payment_status_code = status_data.get("payment_status_description", "").upper()
-            pesapal_status = status_data.get("status_code")
-            
-            logger.info(f"Verification status: {payment_status_code}, code={pesapal_status}")
-
-            if payment_status_code == "COMPLETED" or pesapal_status == 1:
-                logger.info(f"Payment verified as COMPLETED!")
-                payment.status = "COMPLETED"
-                payment.updated_at = datetime.utcnow()
-                db.commit()
-                _enroll_user_in_course(db, payment.user_id, payment.course_id)
-            elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
-                logger.warning(f"Payment verified as FAILED")
-                payment.status = "FAILED"
-                payment.updated_at = datetime.utcnow()
-                db.commit()
-            else:
-                logger.info(f"Payment still pending according to PesaPal")
-        except Exception as e:
-            logger.error(f"Error re-querying PesaPal in verify endpoint: {e}", exc_info=True)
-
-    logger.info(f"Final payment status: {payment.status}")
-
-    return PaymentStatusResponse(
-        merchant_reference=payment.merchant_reference,
-        order_tracking_id=payment.order_tracking_id,
-        status=payment.status,
-        amount=payment.amount,
-        currency=payment.currency,
-        course_id=payment.course_id,
-        created_at=payment.created_at,
+    access_token = create_access_token(
+        data={"sub": user.email},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-
-
-@app.get("/payments/my-payments")
-async def get_my_payments(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Return all payment records for the current user."""
-    logger.info(f"Fetching payments for user: {current_user.id}")
-    
-    payments = db.query(PaymentModel).filter(
-        PaymentModel.user_id == current_user.id
-    ).order_by(PaymentModel.created_at.desc()).all()
-    
-    logger.info(f"Found {len(payments)} payments")
-
-    result = []
-    for p in payments:
-        course = db.query(CourseModel).filter(CourseModel.id == p.course_id).first()
-        result.append({
-            "id": p.id,
-            "course_id": p.course_id,
-            "course_title": course.title if course else "Unknown",
-            "merchant_reference": p.merchant_reference,
-            "order_tracking_id": p.order_tracking_id,
-            "amount": p.amount,
-            "currency": p.currency,
-            "status": p.status,
-            "created_at": p.created_at,
-        })
-    return result
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # ---------------------------------------------------------------------------
-# Profile Routes  ← NEW
+# Profile Routes
 # ---------------------------------------------------------------------------
 
 @app.get("/users/me/profile", response_model=ProfileResponse)
@@ -2062,7 +1699,6 @@ async def update_my_profile(
                 status_code=400,
                 detail="Invalid image type. Only JPEG, PNG, GIF, and WebP are allowed.",
             )
-        # Delete old avatar from B2 if it exists
         if user.profile_image_filename:
             try:
                 await delete_from_b2(user.profile_image_filename)
@@ -2176,7 +1812,7 @@ async def get_bulk_course_image_urls(
 # Video Streaming
 # ---------------------------------------------------------------------------
 
-_VIDEO_CHUNK_SIZE = 512 * 1024  # 512 KB
+_VIDEO_CHUNK_SIZE = 512 * 1024
 
 
 @app.get("/stream/video/{filename:path}")
@@ -2218,13 +1854,11 @@ async def stream_video(
         raise HTTPException(status_code=404, detail="No video for this lesson")
 
     object_key = lesson.video_filename
-    logger.info(f"Streaming object key: {object_key}")
 
     try:
         head = b2_client.head_object(Bucket=B2_BUCKET_NAME, Key=object_key)
         file_size = head["ContentLength"]
         content_type = head.get("ContentType") or "video/mp4"
-        logger.info(f"B2 object OK. size={file_size} type={content_type}")
     except ClientError as e:
         logger.error(f"B2 HEAD error: {e}")
         raise HTTPException(status_code=404, detail="Video file not found in storage")
@@ -2241,15 +1875,12 @@ async def stream_video(
             start = int(start_str) if start_str.strip() else 0
             end = int(end_str) if end_str.strip() else file_size - 1
             end = min(end, file_size - 1)
-
             if start > end or start >= file_size:
                 raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-
             get_kwargs["Range"] = f"bytes={start}-{end}"
             content_length = end - start + 1
             status_code = 206
             content_range = f"bytes {start}-{end}/{file_size}"
-            logger.info(f"Range request: {get_kwargs['Range']} ({content_length} bytes)")
         except (ValueError, AttributeError):
             range_header = None
 
@@ -2275,9 +1906,7 @@ async def stream_video(
                     bytes_sent += len(chunk)
                     yield chunk
         except Exception as exc:
-            logger.error(
-                f"Stream error for '{object_key}' after {bytes_sent} bytes: {exc}"
-            )
+            logger.error(f"Stream error for '{object_key}' after {bytes_sent} bytes: {exc}")
 
     headers = {
         "Access-Control-Allow-Origin": "*",
@@ -2311,7 +1940,6 @@ async def get_video_token_by_path(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Video token request for lesson {lesson_id} from user {current_user.id}")
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -2325,7 +1953,6 @@ async def get_video_token_by_path(
     expires_delta = timedelta(minutes=VIDEO_TOKEN_EXPIRE_MINUTES)
     token_data = {"sub": "video_access", "user_id": current_user.id, "lesson_id": lesson_id}
     access_token = create_video_token(token_data, expires_delta=expires_delta)
-    logger.info(f"Video token generated for user {current_user.id}, lesson {lesson_id}")
     return {"token": access_token, "expires_at": datetime.utcnow() + expires_delta}
 
 
@@ -2339,7 +1966,6 @@ async def generate_quiz_for_lesson(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Generating quiz for lesson {lesson_id} by user {current_user.id}")
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -2371,7 +1997,6 @@ async def submit_quiz(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Submitting quiz for lesson {lesson_id} by user {current_user.id}")
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -2422,7 +2047,6 @@ async def submit_quiz(
     db.commit()
     db.refresh(quiz_attempt)
 
-    logger.info(f"Quiz submitted: score {score}/5, passed: {passed}")
     return {
         "score": score,
         "total": 5,
@@ -2625,6 +2249,10 @@ async def get_user_certificates(
 
 @app.get("/certificates/{certificate_hash}/verify")
 async def verify_certificate(certificate_hash: str, db: Session = Depends(get_db)):
+    """
+    Public endpoint — verifies a certificate by its hash.
+    Used by the QR code on the printed certificate.
+    """
     certificate = db.query(CertificateModel).filter(
         CertificateModel.certificate_hash == certificate_hash
     ).first()
@@ -2644,6 +2272,7 @@ async def verify_certificate(certificate_hash: str, db: Session = Depends(get_db
         "course_title": course.title,
         "issued_at": certificate.issued_at,
         "certificate_hash": certificate.certificate_hash,
+        "platform": PLATFORM_NAME,
     }
 
 
@@ -2689,50 +2318,282 @@ async def download_certificate(
 
 
 # ---------------------------------------------------------------------------
-# Auth Routes
+# PesaPal Payment Routes
 # ---------------------------------------------------------------------------
 
-@app.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
+@app.post("/payments/initiate/{course_id}", response_model=PaymentInitiateResponse)
+async def initiate_payment(
+    course_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    logger.info(f"Login attempt for user: {form_data.username}")
-    user = authenticate_user(db, form_data.username, form_data.password)
-    if not user:
+    logger.info(f"=== PAYMENT INITIATION START ===")
+    logger.info(f"Course ID: {course_id}, User: {current_user.email} (ID: {current_user.id})")
+
+    course = db.query(CourseModel).filter(
+        CourseModel.id == course_id,
+        CourseModel.is_published == True,
+    ).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
+
+    existing_enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id,
+    ).first()
+    if existing_enrollment:
+        raise HTTPException(status_code=400, detail="You are already enrolled in this course.")
+
+    existing_completed_payment = db.query(PaymentModel).filter(
+        PaymentModel.user_id == current_user.id,
+        PaymentModel.course_id == course_id,
+        PaymentModel.status == "COMPLETED",
+    ).first()
+    if existing_completed_payment:
+        _enroll_user_in_course(db, current_user.id, course_id)
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=400,
+            detail="Payment already completed. You have been enrolled in the course."
         )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
-    logger.info(f"Successful login for user: {form_data.username}")
-    return {"access_token": access_token, "token_type": "bearer"}
 
+    merchant_reference = f"crs-{course_id}-usr-{current_user.id}-{uuid.uuid4().hex[:8]}"
+    pesapal_token = pesapal_get_token()
+    ipn_id = pesapal_register_ipn(pesapal_token)
 
-@app.post("/users/", response_model=User)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    logger.info(f"Creating new user: {user.email}")
-    db_user = get_user_by_email(db, email=user.email)
-    if db_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    hashed_password = get_password_hash(user.password)
-    db_user = UserModel(
-        email=user.email,
-        hashed_password=hashed_password,
-        full_name=user.full_name,
-        is_instructor=user.is_instructor,
+    callback_url = f"{PESAPAL_CALLBACK_URL}?merchant_reference={merchant_reference}"
+    name_parts = current_user.full_name.strip().split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    order_data = pesapal_submit_order(
+        token=pesapal_token,
+        ipn_id=ipn_id,
+        merchant_reference=merchant_reference,
+        amount=COURSE_PRICE_UGX,
+        currency="UGX",
+        description=f"Enrollment: {course.title}"[:100],
+        email=current_user.email,
+        first_name=first_name,
+        last_name=last_name,
+        callback_url=callback_url,
     )
-    db.add(db_user)
+
+    order_tracking_id = order_data.get("order_tracking_id")
+    redirect_url = order_data.get("redirect_url")
+
+    if not redirect_url:
+        raise HTTPException(status_code=502, detail="PesaPal did not return a payment URL.")
+
+    payment = PaymentModel(
+        user_id=current_user.id,
+        course_id=course_id,
+        merchant_reference=merchant_reference,
+        order_tracking_id=order_tracking_id,
+        amount=COURSE_PRICE_UGX,
+        currency="UGX",
+        status="PENDING",
+    )
+    db.add(payment)
     db.commit()
-    db.refresh(db_user)
-    logger.info(f"User created successfully: {user.email}")
-    return db_user
+    db.refresh(payment)
+
+    return PaymentInitiateResponse(
+        redirect_url=redirect_url,
+        merchant_reference=merchant_reference,
+        order_tracking_id=order_tracking_id,
+    )
 
 
-@app.get("/users/me/", response_model=User)
-async def read_users_me(current_user: User = Depends(get_current_user)):
-    return current_user
+@app.get("/payments/callback")
+async def payment_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    logger.info(f"=== PAYMENT CALLBACK RECEIVED ===")
+    params = dict(request.query_params)
+    logger.info(f"Callback query parameters (FULL): {json.dumps(params, indent=2)}")
+
+    order_tracking_id = params.get("OrderTrackingId") or params.get("orderTrackingId")
+    merchant_reference = params.get("OrderMerchantReference") or params.get("merchant_reference")
+
+    if not merchant_reference:
+        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Missing+payment+reference"
+        return RedirectResponse(url=redirect_url, status_code=302)
+
+    payment = db.query(PaymentModel).filter(
+        PaymentModel.merchant_reference == merchant_reference
+    ).first()
+
+    if not payment:
+        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Payment+not+found"
+        return RedirectResponse(url=redirect_url, status_code=302)
+
+    if order_tracking_id and not payment.order_tracking_id:
+        payment.order_tracking_id = order_tracking_id
+        db.commit()
+
+    tracking_id = payment.order_tracking_id or order_tracking_id
+
+    if not tracking_id:
+        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
+        return RedirectResponse(url=redirect_url, status_code=302)
+
+    try:
+        pesapal_token = pesapal_get_token()
+        status_data = pesapal_get_transaction_status(pesapal_token, tracking_id)
+        payment_status_code = status_data.get("payment_status_description", "").upper()
+        pesapal_status = status_data.get("status_code")
+
+        if payment_status_code == "COMPLETED" or pesapal_status == 1:
+            payment.status = "COMPLETED"
+            db.commit()
+            _enroll_user_in_course(db, payment.user_id, payment.course_id)
+            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=success&course_id={payment.course_id}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+        elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
+            payment.status = "FAILED"
+            db.commit()
+            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=failed&course_id={payment.course_id}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+        else:
+            redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+
+    except Exception as e:
+        logger.error(f"Error verifying payment on callback: {e}", exc_info=True)
+        redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
+        return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@app.get("/payments/ipn")
+async def payment_ipn(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    logger.info(f"=== IPN RECEIVED ===")
+    params = dict(request.query_params)
+    logger.info(f"IPN query parameters (FULL): {json.dumps(params, indent=2)}")
+
+    order_tracking_id = params.get("orderTrackingId") or params.get("OrderTrackingId")
+    merchant_reference = params.get("orderMerchantReference") or params.get("OrderMerchantReference")
+    order_notification_type = params.get("orderNotificationType")
+
+    if not order_tracking_id:
+        return {"status": "ignored", "reason": "missing orderTrackingId"}
+
+    payment = None
+    if merchant_reference:
+        payment = db.query(PaymentModel).filter(
+            PaymentModel.merchant_reference == merchant_reference
+        ).first()
+    if not payment and order_tracking_id:
+        payment = db.query(PaymentModel).filter(
+            PaymentModel.order_tracking_id == order_tracking_id
+        ).first()
+
+    if not payment:
+        return {"status": "ignored", "reason": "payment not found"}
+
+    if order_tracking_id and not payment.order_tracking_id:
+        payment.order_tracking_id = order_tracking_id
+        db.commit()
+
+    try:
+        pesapal_token = pesapal_get_token()
+        status_data = pesapal_get_transaction_status(pesapal_token, order_tracking_id)
+        payment_status_code = status_data.get("payment_status_description", "").upper()
+        pesapal_status = status_data.get("status_code")
+
+        if payment_status_code == "COMPLETED" or pesapal_status == 1:
+            if payment.status != "COMPLETED":
+                payment.status = "COMPLETED"
+                payment.updated_at = datetime.utcnow()
+                db.commit()
+                _enroll_user_in_course(db, payment.user_id, payment.course_id)
+        elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
+            if payment.status != "FAILED":
+                payment.status = "FAILED"
+                payment.updated_at = datetime.utcnow()
+                db.commit()
+
+    except Exception as e:
+        logger.error(f"IPN processing error: {e}", exc_info=True)
+
+    return {
+        "orderNotificationType": order_notification_type,
+        "orderTrackingId": order_tracking_id,
+        "orderMerchantReference": merchant_reference,
+    }
+
+
+@app.get("/payments/verify/{merchant_reference}", response_model=PaymentStatusResponse)
+async def verify_payment(
+    merchant_reference: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    payment = db.query(PaymentModel).filter(
+        PaymentModel.merchant_reference == merchant_reference,
+        PaymentModel.user_id == current_user.id,
+    ).first()
+
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment record not found.")
+
+    if payment.status == "PENDING" and payment.order_tracking_id:
+        try:
+            pesapal_token = pesapal_get_token()
+            status_data = pesapal_get_transaction_status(pesapal_token, payment.order_tracking_id)
+            payment_status_code = status_data.get("payment_status_description", "").upper()
+            pesapal_status = status_data.get("status_code")
+
+            if payment_status_code == "COMPLETED" or pesapal_status == 1:
+                payment.status = "COMPLETED"
+                payment.updated_at = datetime.utcnow()
+                db.commit()
+                _enroll_user_in_course(db, payment.user_id, payment.course_id)
+            elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
+                payment.status = "FAILED"
+                payment.updated_at = datetime.utcnow()
+                db.commit()
+        except Exception as e:
+            logger.error(f"Error re-querying PesaPal in verify endpoint: {e}", exc_info=True)
+
+    return PaymentStatusResponse(
+        merchant_reference=payment.merchant_reference,
+        order_tracking_id=payment.order_tracking_id,
+        status=payment.status,
+        amount=payment.amount,
+        currency=payment.currency,
+        course_id=payment.course_id,
+        created_at=payment.created_at,
+    )
+
+
+@app.get("/payments/my-payments")
+async def get_my_payments(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    payments = db.query(PaymentModel).filter(
+        PaymentModel.user_id == current_user.id
+    ).order_by(PaymentModel.created_at.desc()).all()
+
+    result = []
+    for p in payments:
+        course = db.query(CourseModel).filter(CourseModel.id == p.course_id).first()
+        result.append({
+            "id": p.id,
+            "course_id": p.course_id,
+            "course_title": course.title if course else "Unknown",
+            "merchant_reference": p.merchant_reference,
+            "order_tracking_id": p.order_tracking_id,
+            "amount": p.amount,
+            "currency": p.currency,
+            "status": p.status,
+            "created_at": p.created_at,
+        })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2747,7 +2608,6 @@ async def create_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Creating course: {title} by user: {current_user.email}")
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can create courses")
 
@@ -2755,12 +2615,8 @@ async def create_course(
     if image_file:
         allowed_image_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         if image_file.content_type not in allowed_image_types:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.",
-            )
+            raise HTTPException(status_code=400, detail="Invalid file type.")
         image_filename = await upload_to_b2(image_file, "courses")
-        logger.info(f"Course image uploaded to B2: {image_filename}")
 
     db_course = CourseModel(
         title=title,
@@ -2778,7 +2634,6 @@ async def create_course(
 
 @app.get("/courses/", response_model=List[Course])
 async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    logger.info(f"Fetching courses, skip: {skip}, limit: {limit}")
     courses = db.query(CourseModel).filter(CourseModel.is_published == True).offset(skip).limit(limit).all()
 
     course_list = []
@@ -2788,13 +2643,11 @@ async def read_courses(skip: int = 0, limit: int = 100, db: Session = Depends(ge
         instructor_name = instructor.full_name if instructor else "Unknown Instructor"
         course_list.append(_build_course_response(course, instructor_name, image_url))
 
-    logger.info(f"Returning {len(course_list)} courses")
     return course_list
 
 
 @app.get("/courses/{course_id}", response_model=Course)
 async def read_course(course_id: int, db: Session = Depends(get_db)):
-    logger.info(f"Fetching course: {course_id}")
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
@@ -2814,7 +2667,6 @@ async def update_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Updating course: {course_id} by user: {current_user.email}")
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can update courses")
 
@@ -2832,14 +2684,10 @@ async def update_course(
     if image_file:
         allowed_image_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         if image_file.content_type not in allowed_image_types:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.",
-            )
+            raise HTTPException(status_code=400, detail="Invalid file type.")
         if course.image_filename:
             await delete_from_b2(course.image_filename)
         course.image_filename = await upload_to_b2(image_file, "courses")
-        logger.info(f"Updated course image uploaded to B2: {course.image_filename}")
 
     db.commit()
     db.refresh(course)
@@ -2847,7 +2695,6 @@ async def update_course(
     image_url = await get_course_image_url(course)
     instructor = db.query(UserModel).filter(UserModel.id == course.instructor_id).first()
     instructor_name = instructor.full_name if instructor else "Unknown Instructor"
-    logger.info(f"Course updated successfully: {course_id}")
     return _build_course_response(course, instructor_name, image_url)
 
 
@@ -2971,12 +2818,8 @@ async def create_lesson(
     if video_file:
         allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
         if video_file.content_type not in allowed_video_types:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed.",
-            )
+            raise HTTPException(status_code=400, detail="Invalid file type.")
         video_filename = await upload_to_b2(video_file, "lessons")
-        logger.info(f"Video uploaded to B2: {video_filename}")
 
     db_lesson = LessonModel(
         title=title, content=content, module_id=module_id,
@@ -3091,10 +2934,7 @@ async def update_lesson(
     if video_file:
         allowed_video_types = ["video/mp4", "video/mov", "video/avi", "video/webm", "video/quicktime"]
         if video_file.content_type not in allowed_video_types:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file type. Only MP4, MOV, AVI, and WebM files are allowed.",
-            )
+            raise HTTPException(status_code=400, detail="Invalid file type.")
         if lesson.video_filename:
             await delete_from_b2(lesson.video_filename)
         lesson.video_filename = await upload_to_b2(video_file, "lessons")
@@ -3131,7 +2971,7 @@ async def delete_lesson(
 
 
 # ---------------------------------------------------------------------------
-# Enrollment Routes (kept for instructor use / direct enrollment)
+# Enrollment Routes
 # ---------------------------------------------------------------------------
 
 @app.post("/enroll/{course_id}")
@@ -3140,7 +2980,6 @@ def enroll_in_course(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Direct enrollment (for instructors or free overrides). Regular users should pay via /payments/initiate/."""
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
@@ -3510,7 +3349,7 @@ async def download_lesson_pdf(
             {lesson.content or 'No content available for this lesson.'}
         </div>
         <div class="footer">
-            Generated on {datetime.now().strftime("%Y-%m-%d %H:%M")} | eLearning Platform
+            Generated on {datetime.now().strftime("%Y-%m-%d %H:%M")} | {PLATFORM_NAME}
         </div>
     </body>
     </html>
@@ -3606,11 +3445,9 @@ async def get_quiz_attempt_details(
     }
 
 
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADD THIS ENDPOINT anywhere after the quiz endpoints in main.py
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# AI Consultation
+# ---------------------------------------------------------------------------
 
 @app.post("/lessons/{lesson_id}/ai-consult", response_model=AIConsultResponse)
 async def ai_consult(
@@ -3622,9 +3459,7 @@ async def ai_consult(
     """
     Let an enrolled student ask the AI tutor a question about a specific lesson.
     The lesson content is injected as context so the AI can give deep, relevant answers.
-    Chat history is NOT stored — each request is stateless.
     """
-    # ── Auth checks ──────────────────────────────────────────────────────────
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -3636,17 +3471,15 @@ async def ai_consult(
     if not enrollment:
         raise HTTPException(status_code=403, detail="Not enrolled in this course")
 
-    # ── Validate question ────────────────────────────────────────────────────
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     if len(question) > 1000:
         raise HTTPException(status_code=400, detail="Question is too long (max 1000 characters)")
 
-    # ── Build prompt ─────────────────────────────────────────────────────────
     lesson_context = lesson.content or "No written content available for this lesson."
 
-    system_prompt = f"""You are an expert AI tutor for an online learning platform called ScienceTech Academy.
+    system_prompt = f"""You are an expert AI tutor for {PLATFORM_NAME}.
 A student is asking a question about a specific lesson. Your role is to:
 - Explain concepts clearly and in depth
 - Use examples, analogies, and step-by-step breakdowns where helpful
@@ -3665,10 +3498,8 @@ Answer the student's question below based on the lesson content above.
 If the question goes beyond the lesson, you may draw on your broader knowledge
 while noting that it extends the lesson material."""
 
-    # ── Call Gemini ──────────────────────────────────────────────────────────
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     if not gemini_api_key:
-        logger.error("GEMINI_API_KEY not set — cannot serve AI consultation")
         raise HTTPException(
             status_code=503,
             detail="AI consultation is temporarily unavailable. Please contact support.",
@@ -3691,10 +3522,9 @@ while noting that it extends the lesson material."""
 
     except Exception as e:
         logger.error(f"AI consultation error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to get AI response. Please try again.",
-        )
+        raise HTTPException(status_code=500, detail="Failed to get AI response. Please try again.")
+
+
 # ---------------------------------------------------------------------------
 # File Upload
 # ---------------------------------------------------------------------------
@@ -3728,9 +3558,7 @@ async def b2_proxy(filename: str, request: Request):
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
         if error_code in ("404", "NoSuchKey", "403", "AccessDenied"):
-            logger.warning(f"B2 proxy: object not found/accessible: {clean_filename} ({error_code})")
             raise HTTPException(status_code=404, detail="File not found")
-        logger.error(f"B2 HEAD error for '{clean_filename}': {error_code}")
         raise HTTPException(status_code=502, detail="Storage error")
 
     file_size = head["ContentLength"]
@@ -3766,7 +3594,6 @@ async def b2_proxy(filename: str, request: Request):
     try:
         b2_response = b2_client.get_object(**get_kwargs)
     except ClientError as e:
-        logger.error(f"B2 GET error for '{clean_filename}': {e}")
         raise HTTPException(status_code=502, detail="Storage fetch error")
 
     def _stream_body(body, chunk_size: int = 65536):
@@ -3881,7 +3708,6 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
         return {"error": "Course not found"}
 
     resolved_key = _resolve_image_filename(course)
-
     b2_info = {}
     if resolved_key:
         try:
@@ -3915,7 +3741,6 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
 @app.get("/debug/pesapal")
 async def debug_pesapal():
     """Test PesaPal authentication and IPN registration. Remove in production."""
-    logger.info("=== PESAPAL DEBUG ENDPOINT CALLED ===")
     try:
         token = pesapal_get_token()
         ipn_id = pesapal_register_ipn(token)
@@ -3926,7 +3751,6 @@ async def debug_pesapal():
             "base_url": PESAPAL_BASE_URL,
         }
     except HTTPException as e:
-        logger.error(f"PesaPal debug error: {e.detail}")
         return {"status": "error", "detail": e.detail}
 
 
@@ -3936,7 +3760,7 @@ async def debug_pesapal():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {"status": "healthy", "platform": PLATFORM_NAME, "timestamp": datetime.utcnow()}
 
 
 # ---------------------------------------------------------------------------
@@ -3945,41 +3769,24 @@ def health_check():
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Running startup migrations...")
+    logger.info(f"Starting {PLATFORM_NAME} API...")
     db = SessionLocal()
     try:
         Base.metadata.create_all(bind=engine)
         migrate_has_quiz_default(db)
-        # Add missing columns if they don't exist
         with engine.begin() as conn:
-            conn.execute(text("""
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS bio TEXT;
-            """))
-            conn.execute(text("""
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS profile_image_filename VARCHAR(255);
-            """))
-            conn.execute(text("""
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS location VARCHAR(255);
-            """))
-            conn.execute(text("""
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS website VARCHAR(255);
-            """))
-            conn.execute(text("""
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
-            """))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image_filename VARCHAR(255);"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(255);"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS website VARCHAR(255);"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);"))
         logger.info("Startup migrations completed successfully")
-        # Pre-register PesaPal IPN on startup so it's ready for first payment
         try:
             token = pesapal_get_token()
             ipn_id = pesapal_register_ipn(token)
             logger.info(f"PesaPal IPN pre-registered on startup. ipn_id={ipn_id}")
         except Exception as pe:
-            logger.warning(f"PesaPal IPN pre-registration failed on startup (will retry on first payment): {pe}")
+            logger.warning(f"PesaPal IPN pre-registration failed on startup: {pe}")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     finally:
