@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter
+from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File, BackgroundTasks, Request, Query, Header, APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, func, text
@@ -6,7 +6,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Set
 from jose import JWTError, jwt
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -129,6 +129,8 @@ class UserModel(Base):
     quiz_attempts = relationship("QuizAttemptModel", back_populates="user")
     certificates = relationship("CertificateModel", back_populates="user")
     payments = relationship("PaymentModel", back_populates="user")
+    sent_messages = relationship("MessageModel", foreign_keys="MessageModel.sender_id", back_populates="sender")
+    received_messages = relationship("MessageModel", foreign_keys="MessageModel.recipient_id", back_populates="recipient")
 
 
 class CourseModel(Base):
@@ -148,6 +150,7 @@ class CourseModel(Base):
     enrollments = relationship("EnrollmentModel", back_populates="course")
     certificates = relationship("CertificateModel", back_populates="course")
     payments = relationship("PaymentModel", back_populates="course")
+    group_messages = relationship("GroupMessageModel", back_populates="course")
 
 
 class ModuleModel(Base):
@@ -252,6 +255,39 @@ class PaymentModel(Base):
 
     user = relationship("UserModel", back_populates="payments")
     course = relationship("CourseModel", back_populates="payments")
+
+
+# ---------------------------------------------------------------------------
+# Messaging Models
+# ---------------------------------------------------------------------------
+
+class MessageModel(Base):
+    """Direct messages between learners and instructors."""
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    sender = relationship("UserModel", foreign_keys=[sender_id], back_populates="sent_messages")
+    recipient = relationship("UserModel", foreign_keys=[recipient_id], back_populates="received_messages")
+
+
+class GroupMessageModel(Base):
+    """Messages in course group chats — all enrolled learners + instructor."""
+    __tablename__ = "group_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    course = relationship("CourseModel", back_populates="group_messages")
+    sender = relationship("UserModel")
 
 
 Base.metadata.create_all(bind=engine)
@@ -520,6 +556,55 @@ class PaymentStatusResponse(BaseModel):
 
 class GoogleAuthRequest(BaseModel):
     credential: str
+
+
+# Messaging Pydantic Models
+class MessageCreate(BaseModel):
+    recipient_id: int
+    content: str
+
+
+class MessageResponse(BaseModel):
+    id: int
+    sender_id: int
+    sender_name: str
+    sender_is_instructor: bool
+    recipient_id: int
+    recipient_name: str
+    content: str
+    is_read: bool
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class GroupMessageCreate(BaseModel):
+    content: str
+
+
+class GroupMessageResponse(BaseModel):
+    id: int
+    course_id: int
+    sender_id: int
+    sender_name: str
+    sender_is_instructor: bool
+    content: str
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class ConversationSummary(BaseModel):
+    other_user_id: int
+    other_user_name: str
+    other_user_is_instructor: bool
+    other_user_avatar: Optional[str] = None
+    last_message: str
+    last_message_at: datetime
+    unread_count: int
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1108,17 +1193,7 @@ def generate_certificate_hash(user_id: int, course_id: int) -> str:
     return hashlib.sha256(unique_string.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# QR Code Generation (pure Python, no external library)
-# Fetches a QR code PNG from the Google Charts API and returns raw bytes.
-# Falls back to a drawn placeholder if the fetch fails.
-# ---------------------------------------------------------------------------
-
 def _fetch_qr_png(verify_url: str, size: int = 120) -> Optional[bytes]:
-    """
-    Fetch a QR-code PNG from the Google Charts API.
-    Returns raw PNG bytes or None on failure.
-    """
     try:
         encoded = quote(verify_url, safe='')
         chart_url = (
@@ -1135,10 +1210,6 @@ def _fetch_qr_png(verify_url: str, size: int = 120) -> Optional[bytes]:
 
 
 class _QRPlaceholder(Flowable):
-    """
-    Fallback: draws a simple bordered square with 'SCAN TO VERIFY' text
-    when the QR image cannot be fetched.
-    """
     def __init__(self, size_pt: float, url: str):
         super().__init__()
         self.size_pt = size_pt
@@ -1153,25 +1224,18 @@ class _QRPlaceholder(Flowable):
         c.setStrokeColor(colors.HexColor('#C9A84C'))
         c.setLineWidth(1.5)
         c.rect(0, 0, self.size_pt, self.size_pt, fill=1, stroke=1)
-
         c.setFillColor(colors.HexColor('#0B1A2E'))
         c.setFont("Helvetica-Bold", 6)
         c.drawCentredString(self.size_pt / 2, self.size_pt * 0.55, "SCAN TO VERIFY")
         c.setFont("Helvetica", 5)
         c.drawCentredString(self.size_pt / 2, self.size_pt * 0.42, "QR code unavailable")
         c.setFont("Helvetica", 4)
-        # Show short hash as fallback text
         short = self.url.split("/")[-1][:16] if "/" in self.url else self.url[:16]
         c.drawCentredString(self.size_pt / 2, self.size_pt * 0.28, short.upper())
         c.restoreState()
 
 
-# ---------------------------------------------------------------------------
-# Modern Certificate PDF — ScienceTech Academy
-# ---------------------------------------------------------------------------
-
 class _HRule(Flowable):
-    """A thin horizontal rule with optional color."""
     def __init__(self, width, thickness=1, color=colors.black):
         super().__init__()
         self.width = width
@@ -1186,40 +1250,32 @@ class _HRule(Flowable):
 
 
 def _draw_certificate_background(canvas, doc):
-    """Draw the decorative page background, borders, and watermark elements."""
     canvas.saveState()
     W, H = A4
 
-    # Deep navy background
     canvas.setFillColor(colors.HexColor('#0B1A2E'))
     canvas.rect(0, 0, W, H, fill=1, stroke=0)
 
-    # Top gold band
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, H - 58, W, 58, fill=1, stroke=0)
 
-    # Bottom gold band
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, 0, W, 58, fill=1, stroke=0)
 
-    # Thin white accent lines just inside the bands
     canvas.setStrokeColor(colors.white)
     canvas.setLineWidth(1)
     canvas.line(0, H - 62, W, H - 62)
     canvas.line(0, 62, W, 62)
 
-    # Side accent bars
     canvas.setFillColor(colors.HexColor('#C9A84C'))
     canvas.rect(0, 58, 14, H - 116, fill=1, stroke=0)
     canvas.rect(W - 14, 58, 14, H - 116, fill=1, stroke=0)
 
-    # Inner white accent lines beside the side bars
     canvas.setStrokeColor(colors.HexColor('#FFFFFF'))
     canvas.setLineWidth(0.5)
     canvas.line(18, 62, 18, H - 62)
     canvas.line(W - 18, 62, W - 18, H - 62)
 
-    # Decorative corner diamonds
     gold = colors.HexColor('#C9A84C')
     corners = [(14, H - 58), (W - 14, H - 58), (14, 58), (W - 14, 58)]
     for cx, cy in corners:
@@ -1237,14 +1293,12 @@ def _draw_certificate_background(canvas, doc):
         canvas.setFillColor(gold)
         canvas.circle(cx, cy, 3, fill=1, stroke=0)
 
-    # Watermark seal (large faint circle in centre)
     canvas.setStrokeColor(colors.HexColor('#1A2E4A'))
     canvas.setLineWidth(1)
     cx, cy = W / 2, H / 2
     for r in (100, 108, 116):
         canvas.circle(cx, cy, r, fill=0, stroke=1)
 
-    # Star points around outer ring
     canvas.setStrokeColor(colors.HexColor('#1A2E4A'))
     canvas.setLineWidth(0.5)
     for i in range(24):
@@ -1255,7 +1309,6 @@ def _draw_certificate_background(canvas, doc):
         y2 = cy + 120 * math.sin(angle)
         canvas.line(x1, y1, x2, y2)
 
-    # Platform name in gold band — ScienceTech Academy
     canvas.setFillColor(colors.HexColor('#0B1A2E'))
     canvas.setFont("Helvetica-Bold", 13)
     canvas.drawCentredString(W / 2, H - 38, "S C I E N C E T E C H   A C A D E M Y")
@@ -1268,7 +1321,6 @@ def _draw_certificate_background(canvas, doc):
 
 
 def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_hash: str) -> BytesIO:
-    """Create a premium certificate PDF for ScienceTech Academy with a scannable QR code."""
     buffer = BytesIO()
 
     left_margin = 38
@@ -1288,7 +1340,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     W, H = A4
     usable_width = W - left_margin - right_margin
 
-    # Colour palette
     GOLD       = colors.HexColor('#C9A84C')
     LIGHT_GOLD = colors.HexColor('#E8D5A3')
     WHITE      = colors.white
@@ -1323,7 +1374,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
 
     elements = []
 
-    # ── Logo (attempt remote fetch; fall back to text) ────────────────────
     try:
         logo_resp = requests.get(
             "https://raw.githubusercontent.com/Dariusmumbere/elearning/main/logo.png",
@@ -1340,23 +1390,17 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     except Exception as e:
         logger.warning(f"Could not load logo for certificate: {e}")
 
-    # ── Eye-brow text ─────────────────────────────────────────────────────
     elements.append(Paragraph("— OFFICIAL CERTIFICATE OF ACHIEVEMENT —", style_eyebrow))
     elements.append(Spacer(1, 4))
-
-    # ── Main title ────────────────────────────────────────────────────────
     elements.append(Paragraph("ScienceTech Academy", style_big_title))
-
     elements.append(Spacer(1, 6))
     elements.append(_HRule(usable_width, thickness=2, color=GOLD))
     elements.append(Spacer(1, 2))
     elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
     elements.append(Spacer(1, 10))
-
     elements.append(Paragraph("This is to proudly certify that", style_present))
     elements.append(Spacer(1, 6))
 
-    # ── Recipient name ────────────────────────────────────────────────────
     name_table = Table(
         [[Paragraph(user.full_name, style_name)]],
         colWidths=[usable_width],
@@ -1373,11 +1417,9 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     ]))
     elements.append(name_table)
     elements.append(Spacer(1, 12))
-
     elements.append(Paragraph("has successfully completed all requirements for the course", style_for_comp))
     elements.append(Spacer(1, 6))
 
-    # ── Course title ──────────────────────────────────────────────────────
     course_table = Table(
         [[Paragraph(course.title, style_course)]],
         colWidths=[usable_width],
@@ -1395,7 +1437,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     ]))
     elements.append(course_table)
     elements.append(Spacer(1, 10))
-
     elements.append(Paragraph(
         "demonstrating dedication, commitment, and mastery of the curriculum.",
         style_body
@@ -1404,33 +1445,23 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     completion_date = datetime.utcnow().strftime("%B %d, %Y")
     elements.append(Paragraph(f"Issued on  {completion_date}", style_date))
     elements.append(Spacer(1, 12))
-
     elements.append(_HRule(usable_width, thickness=0.5, color=LIGHT_GOLD))
     elements.append(Spacer(1, 2))
     elements.append(_HRule(usable_width, thickness=2, color=GOLD))
     elements.append(Spacer(1, 14))
 
-    # ── Signature row + QR code side by side ─────────────────────────────
     verify_url = f"https://{PLATFORM_DOMAIN}/verify/{certificate_hash}"
-
-    # Fetch QR code image
     qr_png_bytes = _fetch_qr_png(verify_url, size=130)
-    qr_size_pt = 1.2 * inch  # 86.4 pt
+    qr_size_pt = 1.2 * inch
 
     if qr_png_bytes:
         qr_img = Image(BytesIO(qr_png_bytes))
         qr_img.drawWidth  = qr_size_pt
         qr_img.drawHeight = qr_size_pt
         qr_img.hAlign = 'CENTER'
-        qr_cell = [
-            qr_img,
-            Paragraph("Scan to verify", style_qr_label),
-        ]
+        qr_cell = [qr_img, Paragraph("Scan to verify", style_qr_label)]
     else:
-        qr_cell = [
-            _QRPlaceholder(qr_size_pt, verify_url),
-            Paragraph("Scan to verify", style_qr_label),
-        ]
+        qr_cell = [_QRPlaceholder(qr_size_pt, verify_url), Paragraph("Scan to verify", style_qr_label)]
 
     def _sig_cell(name, role):
         return [
@@ -1458,7 +1489,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     elements.append(sig_table)
     elements.append(Spacer(1, 12))
 
-    # ── Certificate ID footer ─────────────────────────────────────────────
     id_table = Table(
         [[Paragraph(
             f"Certificate ID: {certificate_hash.upper()}  ·  Verify at {PLATFORM_DOMAIN}/verify/{certificate_hash}",
@@ -1476,7 +1506,6 @@ def create_certificate_pdf(user: UserModel, course: CourseModel, certificate_has
     ]))
     elements.append(id_table)
 
-    # ── Build PDF ─────────────────────────────────────────────────────────
     doc.build(
         elements,
         onFirstPage=_draw_certificate_background,
@@ -1537,6 +1566,85 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
 
 
 # ===========================================================================
+# WebSocket Connection Manager
+# ===========================================================================
+
+class ConnectionManager:
+    def __init__(self):
+        # direct messages: key = user_id, value = set of WebSocket connections
+        self.direct_connections: Dict[int, Set[WebSocket]] = {}
+        # group messages: key = course_id, value = set of WebSocket connections
+        self.group_connections: Dict[int, Set[WebSocket]] = {}
+
+    async def connect_direct(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        if user_id not in self.direct_connections:
+            self.direct_connections[user_id] = set()
+        self.direct_connections[user_id].add(websocket)
+        logger.info(f"Direct WS connected: user_id={user_id}")
+
+    def disconnect_direct(self, websocket: WebSocket, user_id: int):
+        if user_id in self.direct_connections:
+            self.direct_connections[user_id].discard(websocket)
+            if not self.direct_connections[user_id]:
+                del self.direct_connections[user_id]
+        logger.info(f"Direct WS disconnected: user_id={user_id}")
+
+    async def connect_group(self, websocket: WebSocket, course_id: int):
+        await websocket.accept()
+        if course_id not in self.group_connections:
+            self.group_connections[course_id] = set()
+        self.group_connections[course_id].add(websocket)
+        logger.info(f"Group WS connected: course_id={course_id}")
+
+    def disconnect_group(self, websocket: WebSocket, course_id: int):
+        if course_id in self.group_connections:
+            self.group_connections[course_id].discard(websocket)
+            if not self.group_connections[course_id]:
+                del self.group_connections[course_id]
+        logger.info(f"Group WS disconnected: course_id={course_id}")
+
+    async def send_to_user(self, user_id: int, message: dict):
+        """Send a message to all connections of a specific user."""
+        if user_id in self.direct_connections:
+            dead = set()
+            for ws in self.direct_connections[user_id]:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.add(ws)
+            for ws in dead:
+                self.direct_connections[user_id].discard(ws)
+
+    async def broadcast_to_group(self, course_id: int, message: dict):
+        """Broadcast a message to all connections in a course group."""
+        if course_id in self.group_connections:
+            dead = set()
+            for ws in self.group_connections[course_id]:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.add(ws)
+            for ws in dead:
+                self.group_connections[course_id].discard(ws)
+
+
+manager = ConnectionManager()
+
+
+def _get_user_from_ws_token(token: str, db: Session) -> Optional[UserModel]:
+    """Validate a JWT token and return the user (used in WebSocket handlers)."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            return None
+        return get_user_by_email(db, email)
+    except JWTError:
+        return None
+
+
+# ===========================================================================
 # Routes
 # ===========================================================================
 
@@ -1589,10 +1697,6 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 
 @app.post("/auth/google", response_model=Token)
 async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
-    """
-    Verify a Google ID token and return a JWT access token.
-    Creates a new user account if one doesn't exist yet.
-    """
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google Sign-In is not configured.")
 
@@ -1612,7 +1716,6 @@ async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db))
     if not email:
         raise HTTPException(status_code=400, detail="Google account has no email address.")
 
-    # Get or create user
     user = get_user_by_email(db, email)
     if not user:
         random_password = uuid.uuid4().hex
@@ -1645,7 +1748,6 @@ async def get_my_profile(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return full profile for the currently authenticated user, including presigned avatar URL."""
     profile_image_url = None
     if current_user.profile_image_filename:
         profile_image_url = f"/b2-proxy/{current_user.profile_image_filename}"
@@ -1676,7 +1778,6 @@ async def update_my_profile(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update profile fields and/or avatar image for the current user."""
     user = db.query(UserModel).filter(UserModel.id == current_user.id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1705,7 +1806,6 @@ async def update_my_profile(
             except Exception as e:
                 logger.warning(f"Could not delete old profile image: {e}")
         user.profile_image_filename = await upload_to_b2(profile_image, "avatars")
-        logger.info(f"Profile image uploaded for user {user.id}: {user.profile_image_filename}")
 
     db.commit()
     db.refresh(user)
@@ -1714,7 +1814,6 @@ async def update_my_profile(
     if user.profile_image_filename:
         profile_image_url = f"/b2-proxy/{user.profile_image_filename}"
 
-    logger.info(f"Profile updated for user {user.id}")
     return ProfileResponse(
         id=user.id,
         email=user.email,
@@ -1735,7 +1834,6 @@ async def delete_profile_image(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Remove the current user's profile image."""
     user = db.query(UserModel).filter(UserModel.id == current_user.id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2249,10 +2347,6 @@ async def get_user_certificates(
 
 @app.get("/certificates/{certificate_hash}/verify")
 async def verify_certificate(certificate_hash: str, db: Session = Depends(get_db)):
-    """
-    Public endpoint — verifies a certificate by its hash.
-    Used by the QR code on the printed certificate.
-    """
     certificate = db.query(CertificateModel).filter(
         CertificateModel.certificate_hash == certificate_hash
     ).first()
@@ -2327,9 +2421,6 @@ async def initiate_payment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"=== PAYMENT INITIATION START ===")
-    logger.info(f"Course ID: {course_id}, User: {current_user.email} (ID: {current_user.id})")
-
     course = db.query(CourseModel).filter(
         CourseModel.id == course_id,
         CourseModel.is_published == True,
@@ -2405,14 +2496,8 @@ async def initiate_payment(
 
 
 @app.get("/payments/callback")
-async def payment_callback(
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    logger.info(f"=== PAYMENT CALLBACK RECEIVED ===")
+async def payment_callback(request: Request, db: Session = Depends(get_db)):
     params = dict(request.query_params)
-    logger.info(f"Callback query parameters (FULL): {json.dumps(params, indent=2)}")
-
     order_tracking_id = params.get("OrderTrackingId") or params.get("orderTrackingId")
     merchant_reference = params.get("OrderMerchantReference") or params.get("merchant_reference")
 
@@ -2420,10 +2505,7 @@ async def payment_callback(
         redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Missing+payment+reference"
         return RedirectResponse(url=redirect_url, status_code=302)
 
-    payment = db.query(PaymentModel).filter(
-        PaymentModel.merchant_reference == merchant_reference
-    ).first()
-
+    payment = db.query(PaymentModel).filter(PaymentModel.merchant_reference == merchant_reference).first()
     if not payment:
         redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=error&message=Payment+not+found"
         return RedirectResponse(url=redirect_url, status_code=302)
@@ -2433,7 +2515,6 @@ async def payment_callback(
         db.commit()
 
     tracking_id = payment.order_tracking_id or order_tracking_id
-
     if not tracking_id:
         redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
         return RedirectResponse(url=redirect_url, status_code=302)
@@ -2458,7 +2539,6 @@ async def payment_callback(
         else:
             redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
             return RedirectResponse(url=redirect_url, status_code=302)
-
     except Exception as e:
         logger.error(f"Error verifying payment on callback: {e}", exc_info=True)
         redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=pending&course_id={payment.course_id}"
@@ -2466,14 +2546,8 @@ async def payment_callback(
 
 
 @app.get("/payments/ipn")
-async def payment_ipn(
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    logger.info(f"=== IPN RECEIVED ===")
+async def payment_ipn(request: Request, db: Session = Depends(get_db)):
     params = dict(request.query_params)
-    logger.info(f"IPN query parameters (FULL): {json.dumps(params, indent=2)}")
-
     order_tracking_id = params.get("orderTrackingId") or params.get("OrderTrackingId")
     merchant_reference = params.get("orderMerchantReference") or params.get("OrderMerchantReference")
     order_notification_type = params.get("orderNotificationType")
@@ -2483,14 +2557,9 @@ async def payment_ipn(
 
     payment = None
     if merchant_reference:
-        payment = db.query(PaymentModel).filter(
-            PaymentModel.merchant_reference == merchant_reference
-        ).first()
+        payment = db.query(PaymentModel).filter(PaymentModel.merchant_reference == merchant_reference).first()
     if not payment and order_tracking_id:
-        payment = db.query(PaymentModel).filter(
-            PaymentModel.order_tracking_id == order_tracking_id
-        ).first()
-
+        payment = db.query(PaymentModel).filter(PaymentModel.order_tracking_id == order_tracking_id).first()
     if not payment:
         return {"status": "ignored", "reason": "payment not found"}
 
@@ -2515,7 +2584,6 @@ async def payment_ipn(
                 payment.status = "FAILED"
                 payment.updated_at = datetime.utcnow()
                 db.commit()
-
     except Exception as e:
         logger.error(f"IPN processing error: {e}", exc_info=True)
 
@@ -2536,7 +2604,6 @@ async def verify_payment(
         PaymentModel.merchant_reference == merchant_reference,
         PaymentModel.user_id == current_user.id,
     ).first()
-
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found.")
 
@@ -3153,10 +3220,6 @@ def check_lesson_access(
     }
 
 
-# ---------------------------------------------------------------------------
-# Video Token (lesson-scoped path)
-# ---------------------------------------------------------------------------
-
 @app.get("/lessons/{lesson_id}/video-token", response_model=VideoTokenResponse)
 async def get_lesson_video_token(
     lesson_id: int,
@@ -3456,10 +3519,6 @@ async def ai_consult(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Let an enrolled student ask the AI tutor a question about a specific lesson.
-    The lesson content is injected as context so the AI can give deep, relevant answers.
-    """
     lesson = db.query(LessonModel).filter(LessonModel.id == lesson_id).first()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -3541,7 +3600,7 @@ async def upload_course_image(
 
 
 # ---------------------------------------------------------------------------
-# B2 Proxy — TRUE streaming proxy
+# B2 Proxy
 # ---------------------------------------------------------------------------
 
 @app.get("/b2-proxy/{filename:path}")
@@ -3644,6 +3703,454 @@ async def b2_proxy_options(filename: str):
     )
 
 
+# ===========================================================================
+# Messaging REST Endpoints
+# ===========================================================================
+
+@app.post("/messages/direct", response_model=MessageResponse)
+async def send_direct_message(
+    payload: MessageCreate,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a direct message from the current user to another user."""
+    recipient = db.query(UserModel).filter(UserModel.id == payload.recipient_id).first()
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+
+    if payload.recipient_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot send a message to yourself")
+
+    # Learners can only message instructors; instructors can message anyone
+    if not current_user.is_instructor and not recipient.is_instructor:
+        raise HTTPException(status_code=403, detail="Learners can only message instructors")
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="Message too long (max 2000 characters)")
+
+    msg = MessageModel(
+        sender_id=current_user.id,
+        recipient_id=payload.recipient_id,
+        content=content,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    msg_data = {
+        "type": "direct_message",
+        "id": msg.id,
+        "sender_id": current_user.id,
+        "sender_name": current_user.full_name,
+        "sender_is_instructor": current_user.is_instructor,
+        "recipient_id": payload.recipient_id,
+        "recipient_name": recipient.full_name,
+        "content": content,
+        "is_read": False,
+        "created_at": msg.created_at.isoformat(),
+    }
+
+    # Push to both sender and recipient via WebSocket
+    await manager.send_to_user(current_user.id, msg_data)
+    await manager.send_to_user(payload.recipient_id, msg_data)
+
+    return MessageResponse(
+        id=msg.id,
+        sender_id=msg.sender_id,
+        sender_name=current_user.full_name,
+        sender_is_instructor=current_user.is_instructor,
+        recipient_id=msg.recipient_id,
+        recipient_name=recipient.full_name,
+        content=msg.content,
+        is_read=msg.is_read,
+        created_at=msg.created_at,
+    )
+
+
+@app.get("/messages/direct/{other_user_id}", response_model=List[MessageResponse])
+async def get_direct_conversation(
+    other_user_id: int,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Fetch the full conversation between current user and another user."""
+    other_user = db.query(UserModel).filter(UserModel.id == other_user_id).first()
+    if not other_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    messages = db.query(MessageModel).filter(
+        ((MessageModel.sender_id == current_user.id) & (MessageModel.recipient_id == other_user_id)) |
+        ((MessageModel.sender_id == other_user_id) & (MessageModel.recipient_id == current_user.id))
+    ).order_by(MessageModel.created_at.asc()).all()
+
+    # Mark unread messages from the other user as read
+    db.query(MessageModel).filter(
+        MessageModel.sender_id == other_user_id,
+        MessageModel.recipient_id == current_user.id,
+        MessageModel.is_read == False,
+    ).update({"is_read": True})
+    db.commit()
+
+    return [
+        MessageResponse(
+            id=m.id,
+            sender_id=m.sender_id,
+            sender_name=m.sender.full_name,
+            sender_is_instructor=m.sender.is_instructor,
+            recipient_id=m.recipient_id,
+            recipient_name=m.recipient.full_name,
+            content=m.content,
+            is_read=m.is_read,
+            created_at=m.created_at,
+        )
+        for m in messages
+    ]
+
+
+@app.get("/messages/conversations", response_model=List[ConversationSummary])
+async def get_conversations(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all unique conversations for the current user with last message + unread count."""
+    all_messages = db.query(MessageModel).filter(
+        (MessageModel.sender_id == current_user.id) | (MessageModel.recipient_id == current_user.id)
+    ).order_by(MessageModel.created_at.desc()).all()
+
+    seen: Dict[int, ConversationSummary] = {}
+    for m in all_messages:
+        other_id = m.recipient_id if m.sender_id == current_user.id else m.sender_id
+        if other_id in seen:
+            continue
+        other = db.query(UserModel).filter(UserModel.id == other_id).first()
+        if not other:
+            continue
+        unread = db.query(MessageModel).filter(
+            MessageModel.sender_id == other_id,
+            MessageModel.recipient_id == current_user.id,
+            MessageModel.is_read == False,
+        ).count()
+        avatar_url = f"/b2-proxy/{other.profile_image_filename}" if other.profile_image_filename else None
+        seen[other_id] = ConversationSummary(
+            other_user_id=other_id,
+            other_user_name=other.full_name,
+            other_user_is_instructor=other.is_instructor,
+            other_user_avatar=avatar_url,
+            last_message=m.content[:80],
+            last_message_at=m.created_at,
+            unread_count=unread,
+        )
+    return list(seen.values())
+
+
+@app.get("/messages/unread-count")
+async def get_unread_count(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    count = db.query(MessageModel).filter(
+        MessageModel.recipient_id == current_user.id,
+        MessageModel.is_read == False,
+    ).count()
+    return {"unread_count": count}
+
+
+# ---------------------------------------------------------------------------
+# Group (Course) Messaging REST Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/messages/group/{course_id}", response_model=List[GroupMessageResponse])
+async def get_group_messages(
+    course_id: int,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    limit: int = Query(100, le=200),
+):
+    """Fetch recent messages for a course group chat."""
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Allow access to both enrolled learners and the instructor
+    is_instructor = course.instructor_id == current_user.id
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id,
+    ).first()
+    if not is_instructor and not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+
+    messages = db.query(GroupMessageModel).filter(
+        GroupMessageModel.course_id == course_id
+    ).order_by(GroupMessageModel.created_at.asc()).limit(limit).all()
+
+    return [
+        GroupMessageResponse(
+            id=m.id,
+            course_id=m.course_id,
+            sender_id=m.sender_id,
+            sender_name=m.sender.full_name,
+            sender_is_instructor=m.sender.is_instructor,
+            content=m.content,
+            created_at=m.created_at,
+        )
+        for m in messages
+    ]
+
+
+@app.post("/messages/group/{course_id}", response_model=GroupMessageResponse)
+async def send_group_message(
+    course_id: int,
+    payload: GroupMessageCreate,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a message to a course group chat."""
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    is_instructor = course.instructor_id == current_user.id
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id,
+        EnrollmentModel.course_id == course_id,
+    ).first()
+    if not is_instructor and not enrollment:
+        raise HTTPException(status_code=403, detail="Not enrolled in this course")
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="Message too long (max 2000 characters)")
+
+    msg = GroupMessageModel(
+        course_id=course_id,
+        sender_id=current_user.id,
+        content=content,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    msg_data = {
+        "type": "group_message",
+        "id": msg.id,
+        "course_id": course_id,
+        "sender_id": current_user.id,
+        "sender_name": current_user.full_name,
+        "sender_is_instructor": current_user.is_instructor,
+        "content": content,
+        "created_at": msg.created_at.isoformat(),
+    }
+
+    # Broadcast to everyone in this course's group channel
+    await manager.broadcast_to_group(course_id, msg_data)
+
+    return GroupMessageResponse(
+        id=msg.id,
+        course_id=msg.course_id,
+        sender_id=msg.sender_id,
+        sender_name=current_user.full_name,
+        sender_is_instructor=current_user.is_instructor,
+        content=msg.content,
+        created_at=msg.created_at,
+    )
+
+
+@app.get("/messages/my-instructors")
+async def get_my_instructors(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all instructors the current learner can message (from their enrolled courses)."""
+    enrollments = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == current_user.id
+    ).all()
+    instructor_ids = set()
+    for e in enrollments:
+        course = db.query(CourseModel).filter(CourseModel.id == e.course_id).first()
+        if course:
+            instructor_ids.add(course.instructor_id)
+
+    instructors = []
+    for iid in instructor_ids:
+        user = db.query(UserModel).filter(UserModel.id == iid).first()
+        if user:
+            avatar_url = f"/b2-proxy/{user.profile_image_filename}" if user.profile_image_filename else None
+            instructors.append({
+                "id": user.id,
+                "full_name": user.full_name,
+                "email": user.email,
+                "avatar_url": avatar_url,
+            })
+    return instructors
+
+
+@app.get("/messages/my-learners")
+async def get_my_learners(
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all learners enrolled in the instructor's courses."""
+    if not current_user.is_instructor:
+        raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
+
+    courses = db.query(CourseModel).filter(CourseModel.instructor_id == current_user.id).all()
+    learner_ids = set()
+    for course in courses:
+        for enrollment in course.enrollments:
+            learner_ids.add(enrollment.user_id)
+
+    learners = []
+    for lid in learner_ids:
+        user = db.query(UserModel).filter(UserModel.id == lid).first()
+        if user:
+            avatar_url = f"/b2-proxy/{user.profile_image_filename}" if user.profile_image_filename else None
+            learners.append({
+                "id": user.id,
+                "full_name": user.full_name,
+                "email": user.email,
+                "avatar_url": avatar_url,
+            })
+    return learners
+
+
+# ===========================================================================
+# WebSocket Endpoints
+# ===========================================================================
+
+@app.websocket("/ws/direct/{user_id}")
+async def websocket_direct(
+    websocket: WebSocket,
+    user_id: int,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    WebSocket for real-time direct messages.
+    Client authenticates via `?token=<jwt>`.
+    Messages from the client are processed and dispatched server-side.
+    """
+    user = _get_user_from_ws_token(token, db)
+    if not user or user.id != user_id:
+        await websocket.close(code=4001)
+        return
+
+    await manager.connect_direct(websocket, user_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Client can send: {"recipient_id": int, "content": str}
+            recipient_id = data.get("recipient_id")
+            content = (data.get("content") or "").strip()
+            if not recipient_id or not content:
+                continue
+
+            recipient = db.query(UserModel).filter(UserModel.id == recipient_id).first()
+            if not recipient:
+                continue
+            if not user.is_instructor and not recipient.is_instructor:
+                continue
+            if len(content) > 2000:
+                content = content[:2000]
+
+            msg = MessageModel(
+                sender_id=user.id,
+                recipient_id=recipient_id,
+                content=content,
+            )
+            db.add(msg)
+            db.commit()
+            db.refresh(msg)
+
+            msg_data = {
+                "type": "direct_message",
+                "id": msg.id,
+                "sender_id": user.id,
+                "sender_name": user.full_name,
+                "sender_is_instructor": user.is_instructor,
+                "recipient_id": recipient_id,
+                "recipient_name": recipient.full_name,
+                "content": content,
+                "is_read": False,
+                "created_at": msg.created_at.isoformat(),
+            }
+            await manager.send_to_user(user.id, msg_data)
+            await manager.send_to_user(recipient_id, msg_data)
+
+    except WebSocketDisconnect:
+        manager.disconnect_direct(websocket, user_id)
+
+
+@app.websocket("/ws/group/{course_id}")
+async def websocket_group(
+    websocket: WebSocket,
+    course_id: int,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    WebSocket for real-time course group chat.
+    Client authenticates via `?token=<jwt>`.
+    """
+    user = _get_user_from_ws_token(token, db)
+    if not user:
+        await websocket.close(code=4001)
+        return
+
+    course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+    if not course:
+        await websocket.close(code=4004)
+        return
+
+    is_instructor = course.instructor_id == user.id
+    enrollment = db.query(EnrollmentModel).filter(
+        EnrollmentModel.user_id == user.id,
+        EnrollmentModel.course_id == course_id,
+    ).first()
+    if not is_instructor and not enrollment:
+        await websocket.close(code=4003)
+        return
+
+    await manager.connect_group(websocket, course_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            content = (data.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > 2000:
+                content = content[:2000]
+
+            msg = GroupMessageModel(
+                course_id=course_id,
+                sender_id=user.id,
+                content=content,
+            )
+            db.add(msg)
+            db.commit()
+            db.refresh(msg)
+
+            msg_data = {
+                "type": "group_message",
+                "id": msg.id,
+                "course_id": course_id,
+                "sender_id": user.id,
+                "sender_name": user.full_name,
+                "sender_is_instructor": user.is_instructor,
+                "content": content,
+                "created_at": msg.created_at.isoformat(),
+            }
+            await manager.broadcast_to_group(course_id, msg_data)
+
+    except WebSocketDisconnect:
+        manager.disconnect_group(websocket, course_id)
+
+
 # ---------------------------------------------------------------------------
 # Migration
 # ---------------------------------------------------------------------------
@@ -3740,7 +4247,6 @@ async def debug_course_image(course_id: int, db: Session = Depends(get_db)):
 
 @app.get("/debug/pesapal")
 async def debug_pesapal():
-    """Test PesaPal authentication and IPN registration. Remove in production."""
     try:
         token = pesapal_get_token()
         ipn_id = pesapal_register_ipn(token)
@@ -3780,6 +4286,7 @@ async def startup_event():
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS website VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);"))
+            # Messaging tables are created via Base.metadata.create_all above
         logger.info("Startup migrations completed successfully")
         try:
             token = pesapal_get_token()
