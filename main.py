@@ -95,7 +95,7 @@ EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "sciencetechacademy2026@gmail.com")        # e.g. yourplatform@gmail.com
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "htcr wuba yynf hokh") # App password for Gmail
-EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", ScienceTech Academy)
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "ScienceTech Academy")
 EMAIL_ENABLED = bool(EMAIL_HOST_USER and EMAIL_HOST_PASSWORD)
 
 # Redis configuration
