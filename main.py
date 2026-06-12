@@ -48,6 +48,9 @@ import asyncio
 import math
 import redis
 import pickle
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # Set logging
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +87,16 @@ PLATFORM_TAGLINE = "Empowering Learners Worldwide"
 
 _pesapal_token_cache: dict = {}
 _pesapal_ipn_id: Optional[str] = None
+
+# ---------------------------------------------------------------------------
+# Email Configuration
+# ---------------------------------------------------------------------------
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "sciencetechacademy2026@gmail.com")        # e.g. yourplatform@gmail.com
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "htcr wuba yynf hokh") # App password for Gmail
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", ScienceTech Academy)
+EMAIL_ENABLED = bool(EMAIL_HOST_USER and EMAIL_HOST_PASSWORD)
 
 # Redis configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -821,6 +834,173 @@ async def get_course_image_url(course: CourseModel) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Email Helper Functions
+# ---------------------------------------------------------------------------
+
+def _build_enrollment_email_html(user_name: str, course_title: str, course_url: str) -> str:
+    """Build a styled HTML email body for enrollment confirmation."""
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Enrollment Confirmation</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f9;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0"
+               style="background-color:#ffffff;border-radius:8px;overflow:hidden;
+                      box-shadow:0 2px 8px rgba(0,0,0,0.08);max-width:600px;width:100%;">
+
+          <!-- Header -->
+          <tr>
+            <td style="background-color:#0B1A2E;padding:32px 40px;text-align:center;">
+              <h1 style="margin:0;color:#C9A84C;font-size:22px;letter-spacing:1px;">
+                {PLATFORM_NAME}
+              </h1>
+              <p style="margin:6px 0 0;color:#A8C8E8;font-size:13px;">{PLATFORM_TAGLINE}</p>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:40px 40px 24px;">
+              <h2 style="margin:0 0 16px;color:#0B1A2E;font-size:20px;">
+                🎉 You're enrolled!
+              </h2>
+              <p style="margin:0 0 12px;color:#444;font-size:15px;line-height:1.6;">
+                Hi <strong>{user_name}</strong>,
+              </p>
+              <p style="margin:0 0 20px;color:#444;font-size:15px;line-height:1.6;">
+                Congratulations! You have been successfully enrolled in:
+              </p>
+
+              <!-- Course box -->
+              <table width="100%" cellpadding="0" cellspacing="0"
+                     style="background-color:#f0f4ff;border-left:4px solid #C9A84C;
+                            border-radius:4px;margin-bottom:24px;">
+                <tr>
+                  <td style="padding:16px 20px;">
+                    <p style="margin:0;font-size:16px;font-weight:bold;color:#0B1A2E;">
+                      {course_title}
+                    </p>
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:0 0 28px;color:#444;font-size:15px;line-height:1.6;">
+                You can now access your course material, watch lessons, take quizzes,
+                and track your progress — all at your own pace.
+              </p>
+
+              <!-- CTA Button -->
+              <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+                <tr>
+                  <td style="background-color:#C9A84C;border-radius:6px;">
+                    <a href="{course_url}"
+                       style="display:inline-block;padding:14px 32px;color:#0B1A2E;
+                              font-weight:bold;font-size:15px;text-decoration:none;
+                              letter-spacing:0.5px;">
+                      Start Learning →
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:0;color:#888;font-size:13px;line-height:1.6;">
+                If the button above doesn't work, copy and paste this link into your browser:<br/>
+                <a href="{course_url}" style="color:#3a7bd5;">{course_url}</a>
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color:#f9f9f9;padding:20px 40px;border-top:1px solid #eee;
+                       text-align:center;">
+              <p style="margin:0;color:#aaa;font-size:12px;">
+                © {datetime.utcnow().year} {PLATFORM_NAME} · {PLATFORM_DOMAIN}
+              </p>
+              <p style="margin:6px 0 0;color:#aaa;font-size:12px;">
+                You received this email because you enrolled in a course on our platform.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+
+def _build_enrollment_email_text(user_name: str, course_title: str, course_url: str) -> str:
+    """Plain-text fallback for enrollment confirmation email."""
+    return (
+        f"Hi {user_name},\n\n"
+        f"Congratulations! You have been successfully enrolled in:\n\n"
+        f"  {course_title}\n\n"
+        f"Start learning now: {course_url}\n\n"
+        f"Good luck on your learning journey!\n\n"
+        f"— The {PLATFORM_NAME} Team\n"
+        f"  {PLATFORM_DOMAIN}"
+    )
+
+
+def send_enrollment_email(user_email: str, user_name: str, course_title: str, course_id: int):
+    """
+    Send an enrollment confirmation email via SMTP.
+    This is a synchronous function — call it inside a BackgroundTask.
+    Does nothing (logs a warning) if email credentials are not configured.
+    """
+    if not EMAIL_ENABLED:
+        logger.warning(
+            "Email not configured (EMAIL_HOST_USER / EMAIL_HOST_PASSWORD missing). "
+            f"Skipping enrollment email for {user_email}."
+        )
+        return
+
+    course_url = f"https://{PLATFORM_DOMAIN}/courses/{course_id}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"You're enrolled in {course_title} — {PLATFORM_NAME}"
+    msg["From"] = f"{EMAIL_FROM_NAME} <{EMAIL_HOST_USER}>"
+    msg["To"] = user_email
+
+    text_part = MIMEText(
+        _build_enrollment_email_text(user_name, course_title, course_url), "plain", "utf-8"
+    )
+    html_part = MIMEText(
+        _build_enrollment_email_html(user_name, course_title, course_url), "html", "utf-8"
+    )
+    # Clients render the last part first (prefer HTML)
+    msg.attach(text_part)
+    msg.attach(html_part)
+
+    try:
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=15) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.login(EMAIL_HOST_USER, EMAIL_HOST_PASSWORD)
+            smtp.sendmail(EMAIL_HOST_USER, user_email, msg.as_string())
+        logger.info(f"Enrollment email sent to {user_email} for course '{course_title}'")
+    except smtplib.SMTPAuthenticationError:
+        logger.error(
+            "SMTP authentication failed. Check EMAIL_HOST_USER and EMAIL_HOST_PASSWORD. "
+            "For Gmail, use an App Password, not your account password."
+        )
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending enrollment email to {user_email}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error sending enrollment email to {user_email}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Quiz Cache Helpers
 # ---------------------------------------------------------------------------
 
@@ -1075,7 +1255,16 @@ def pesapal_get_transaction_status(token: str, order_tracking_id: str) -> dict:
         raise HTTPException(status_code=502, detail="Could not query payment status from PesaPal.")
 
 
-def _enroll_user_in_course(db: Session, user_id: int, course_id: int):
+def _enroll_user_in_course(
+    db: Session,
+    user_id: int,
+    course_id: int,
+    background_tasks: Optional[BackgroundTasks] = None,
+):
+    """
+    Enroll a user in a course.  If the enrollment is new and background_tasks
+    is provided, a confirmation email is queued as a background task.
+    """
     existing = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == user_id,
         EnrollmentModel.course_id == course_id,
@@ -1085,6 +1274,19 @@ def _enroll_user_in_course(db: Session, user_id: int, course_id: int):
         db.add(enrollment)
         db.commit()
         logger.info(f"User {user_id} enrolled in course {course_id} after payment.")
+
+        # Queue enrollment email
+        if background_tasks is not None:
+            user = db.query(UserModel).filter(UserModel.id == user_id).first()
+            course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
+            if user and course:
+                background_tasks.add_task(
+                    send_enrollment_email,
+                    user.email,
+                    user.full_name,
+                    course.title,
+                    course_id,
+                )
     else:
         logger.info(f"User {user_id} already enrolled in course {course_id}")
 
@@ -1571,9 +1773,7 @@ def _build_course_response(course: CourseModel, instructor_name: str, image_url:
 
 class ConnectionManager:
     def __init__(self):
-        # direct messages: key = user_id, value = set of WebSocket connections
         self.direct_connections: Dict[int, Set[WebSocket]] = {}
-        # group messages: key = course_id, value = set of WebSocket connections
         self.group_connections: Dict[int, Set[WebSocket]] = {}
 
     async def connect_direct(self, websocket: WebSocket, user_id: int):
@@ -1605,7 +1805,6 @@ class ConnectionManager:
         logger.info(f"Group WS disconnected: course_id={course_id}")
 
     async def send_to_user(self, user_id: int, message: dict):
-        """Send a message to all connections of a specific user."""
         if user_id in self.direct_connections:
             dead = set()
             for ws in self.direct_connections[user_id]:
@@ -1617,7 +1816,6 @@ class ConnectionManager:
                 self.direct_connections[user_id].discard(ws)
 
     async def broadcast_to_group(self, course_id: int, message: dict):
-        """Broadcast a message to all connections in a course group."""
         if course_id in self.group_connections:
             dead = set()
             for ws in self.group_connections[course_id]:
@@ -1633,7 +1831,6 @@ manager = ConnectionManager()
 
 
 def _get_user_from_ws_token(token: str, db: Session) -> Optional[UserModel]:
-    """Validate a JWT token and return the user (used in WebSocket handlers)."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
@@ -2496,7 +2693,11 @@ async def initiate_payment(
 
 
 @app.get("/payments/callback")
-async def payment_callback(request: Request, db: Session = Depends(get_db)):
+async def payment_callback(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     params = dict(request.query_params)
     order_tracking_id = params.get("OrderTrackingId") or params.get("orderTrackingId")
     merchant_reference = params.get("OrderMerchantReference") or params.get("merchant_reference")
@@ -2528,7 +2729,7 @@ async def payment_callback(request: Request, db: Session = Depends(get_db)):
         if payment_status_code == "COMPLETED" or pesapal_status == 1:
             payment.status = "COMPLETED"
             db.commit()
-            _enroll_user_in_course(db, payment.user_id, payment.course_id)
+            _enroll_user_in_course(db, payment.user_id, payment.course_id, background_tasks)
             redirect_url = f"{PESAPAL_CALLBACK_URL.split('/payment')[0]}/payment/result?status=success&course_id={payment.course_id}"
             return RedirectResponse(url=redirect_url, status_code=302)
         elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
@@ -2546,7 +2747,11 @@ async def payment_callback(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/payments/ipn")
-async def payment_ipn(request: Request, db: Session = Depends(get_db)):
+async def payment_ipn(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     params = dict(request.query_params)
     order_tracking_id = params.get("orderTrackingId") or params.get("OrderTrackingId")
     merchant_reference = params.get("orderMerchantReference") or params.get("OrderMerchantReference")
@@ -2578,7 +2783,7 @@ async def payment_ipn(request: Request, db: Session = Depends(get_db)):
                 payment.status = "COMPLETED"
                 payment.updated_at = datetime.utcnow()
                 db.commit()
-                _enroll_user_in_course(db, payment.user_id, payment.course_id)
+                _enroll_user_in_course(db, payment.user_id, payment.course_id, background_tasks)
         elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
             if payment.status != "FAILED":
                 payment.status = "FAILED"
@@ -2597,6 +2802,7 @@ async def payment_ipn(request: Request, db: Session = Depends(get_db)):
 @app.get("/payments/verify/{merchant_reference}", response_model=PaymentStatusResponse)
 async def verify_payment(
     merchant_reference: str,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -2618,7 +2824,7 @@ async def verify_payment(
                 payment.status = "COMPLETED"
                 payment.updated_at = datetime.utcnow()
                 db.commit()
-                _enroll_user_in_course(db, payment.user_id, payment.course_id)
+                _enroll_user_in_course(db, payment.user_id, payment.course_id, background_tasks)
             elif payment_status_code in ("FAILED", "INVALID") or pesapal_status in (0, 2):
                 payment.status = "FAILED"
                 payment.updated_at = datetime.utcnow()
@@ -3044,6 +3250,7 @@ async def delete_lesson(
 @app.post("/enroll/{course_id}")
 def enroll_in_course(
     course_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3059,6 +3266,16 @@ def enroll_in_course(
     enrollment = EnrollmentModel(user_id=current_user.id, course_id=course_id)
     db.add(enrollment)
     db.commit()
+
+    # Send enrollment confirmation email in the background
+    background_tasks.add_task(
+        send_enrollment_email,
+        current_user.email,
+        current_user.full_name,
+        course.title,
+        course_id,
+    )
+
     return {"message": "Successfully enrolled in course"}
 
 
@@ -3713,7 +3930,6 @@ async def send_direct_message(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Send a direct message from the current user to another user."""
     recipient = db.query(UserModel).filter(UserModel.id == payload.recipient_id).first()
     if not recipient:
         raise HTTPException(status_code=404, detail="Recipient not found")
@@ -3721,7 +3937,6 @@ async def send_direct_message(
     if payload.recipient_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot send a message to yourself")
 
-    # Learners can only message instructors; instructors can message anyone
     if not current_user.is_instructor and not recipient.is_instructor:
         raise HTTPException(status_code=403, detail="Learners can only message instructors")
 
@@ -3753,7 +3968,6 @@ async def send_direct_message(
         "created_at": msg.created_at.isoformat(),
     }
 
-    # Push to both sender and recipient via WebSocket
     await manager.send_to_user(current_user.id, msg_data)
     await manager.send_to_user(payload.recipient_id, msg_data)
 
@@ -3776,7 +3990,6 @@ async def get_direct_conversation(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Fetch the full conversation between current user and another user."""
     other_user = db.query(UserModel).filter(UserModel.id == other_user_id).first()
     if not other_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -3786,7 +3999,6 @@ async def get_direct_conversation(
         ((MessageModel.sender_id == other_user_id) & (MessageModel.recipient_id == current_user.id))
     ).order_by(MessageModel.created_at.asc()).all()
 
-    # Mark unread messages from the other user as read
     db.query(MessageModel).filter(
         MessageModel.sender_id == other_user_id,
         MessageModel.recipient_id == current_user.id,
@@ -3815,7 +4027,6 @@ async def get_conversations(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return all unique conversations for the current user with last message + unread count."""
     all_messages = db.query(MessageModel).filter(
         (MessageModel.sender_id == current_user.id) | (MessageModel.recipient_id == current_user.id)
     ).order_by(MessageModel.created_at.desc()).all()
@@ -3869,12 +4080,10 @@ async def get_group_messages(
     db: Session = Depends(get_db),
     limit: int = Query(100, le=200),
 ):
-    """Fetch recent messages for a course group chat."""
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
 
-    # Allow access to both enrolled learners and the instructor
     is_instructor = course.instructor_id == current_user.id
     enrollment = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id,
@@ -3908,7 +4117,6 @@ async def send_group_message(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Send a message to a course group chat."""
     course = db.query(CourseModel).filter(CourseModel.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
@@ -3947,7 +4155,6 @@ async def send_group_message(
         "created_at": msg.created_at.isoformat(),
     }
 
-    # Broadcast to everyone in this course's group channel
     await manager.broadcast_to_group(course_id, msg_data)
 
     return GroupMessageResponse(
@@ -3966,7 +4173,6 @@ async def get_my_instructors(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return all instructors the current learner can message (from their enrolled courses)."""
     enrollments = db.query(EnrollmentModel).filter(
         EnrollmentModel.user_id == current_user.id
     ).all()
@@ -3995,7 +4201,6 @@ async def get_my_learners(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return all learners enrolled in the instructor's courses."""
     if not current_user.is_instructor:
         raise HTTPException(status_code=403, detail="Only instructors can access this endpoint")
 
@@ -4030,11 +4235,6 @@ async def websocket_direct(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    WebSocket for real-time direct messages.
-    Client authenticates via `?token=<jwt>`.
-    Messages from the client are processed and dispatched server-side.
-    """
     user = _get_user_from_ws_token(token, db)
     if not user or user.id != user_id:
         await websocket.close(code=4001)
@@ -4044,7 +4244,6 @@ async def websocket_direct(
     try:
         while True:
             data = await websocket.receive_json()
-            # Client can send: {"recipient_id": int, "content": str}
             recipient_id = data.get("recipient_id")
             content = (data.get("content") or "").strip()
             if not recipient_id or not content:
@@ -4093,10 +4292,6 @@ async def websocket_group(
     token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    WebSocket for real-time course group chat.
-    Client authenticates via `?token=<jwt>`.
-    """
     user = _get_user_from_ws_token(token, db)
     if not user:
         await websocket.close(code=4001)
@@ -4260,6 +4455,19 @@ async def debug_pesapal():
         return {"status": "error", "detail": e.detail}
 
 
+@app.get("/debug/email")
+async def debug_email():
+    """Check email configuration status (no credentials exposed)."""
+    return {
+        "email_enabled": EMAIL_ENABLED,
+        "email_host": EMAIL_HOST,
+        "email_port": EMAIL_PORT,
+        "email_from_name": EMAIL_FROM_NAME,
+        "email_host_user_configured": bool(EMAIL_HOST_USER),
+        "email_password_configured": bool(EMAIL_HOST_PASSWORD),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Health Check
 # ---------------------------------------------------------------------------
@@ -4286,8 +4494,13 @@ async def startup_event():
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS website VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);"))
-            # Messaging tables are created via Base.metadata.create_all above
         logger.info("Startup migrations completed successfully")
+        if EMAIL_ENABLED:
+            logger.info(f"Email notifications enabled (SMTP: {EMAIL_HOST}:{EMAIL_PORT}, from: {EMAIL_HOST_USER})")
+        else:
+            logger.warning(
+                "Email notifications DISABLED — set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD env vars to enable."
+            )
         try:
             token = pesapal_get_token()
             ipn_id = pesapal_register_ipn(token)
